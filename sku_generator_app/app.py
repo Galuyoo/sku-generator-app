@@ -3,13 +3,34 @@ import pandas as pd
 import re
 from itertools import product
 import os
+from PIL import Image
+import base64
+from datetime import datetime
+
+def logo_to_base64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+try:
+    logo = Image.open("logo.png")
+    st.markdown(
+        f"""
+        <div style="text-align: center;">
+            <img src="data:image/png;base64,{logo_to_base64('logo.png')}" width="200"/>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+except Exception as e:
+    st.warning("⚠️ Logo couldn't be loaded.")
 
 st.set_page_config(page_title="SKU Generator", layout="centered")
 
 # --- Load previously used SKU suffixes ---
 SKU_TRACKER_FILE = 'used_sku_suffixes.csv'
 if os.path.exists(SKU_TRACKER_FILE):
-    used_suffixes = pd.read_csv(SKU_TRACKER_FILE)['sku_suffix'].tolist()
+    used_suffixes_df = pd.read_csv(SKU_TRACKER_FILE)
+    used_suffixes = used_suffixes_df['sku_suffix'].tolist()
 else:
     used_suffixes = []
 
@@ -30,33 +51,86 @@ with st.form("sku_form"):
     sku_suffix = st.text_input("Enter unique SKU suffix (e.g., IVARLULE)").strip().upper()
     main_color = st.text_input("Enter main color (e.g., Black)").strip()
     tags = st.text_input("Enter comma-separated tags").strip()
+    lister = st.selectbox("Who is listing this?", ["Sal", "Hannan"])
+    st.markdown("**Enter 10 product descriptions, separated by `|`**")
+    raw_descriptions = st.text_area("Descriptions", height=300).strip()
     submit = st.form_submit_button("Generate Excel")
 
-# --- Maps and Configurations (trimmed for brevity here, insert full dicts below) ---
-# Paste your original body_html_map, product_types, and correct_colors_by_type here
-# I've shortened them below — replace them with your full versions
+# --- Garment Order ---
+garment_keys = [
+    "T-Shirt", "Adult Hoodie", "Adult Sweatshirt", "Ladies Shirt",
+    "Tank-Top", "Longsleeve T-Shirt", "Oversized T Shirts",
+    "kids t shirt", "kids hoodie", "kids sweatshirt"
+]
+
+# --- Size Guides ---
 body_html_map = {
-    "Oversized T Shirts": "XS - 44\" Chest<br>Small - 46\" Chest<br>Medium - 48\" Chest..."
-    # ... add rest
+    "Oversized T Shirts": "XS - 44\" Chest<br>Small - 46\" Chest<br>Medium - 48\" Chest<br>Large - 50\" Chest<br>XL - 53\" Chest<br>2XL - 55\" Chest<br>3XL - 59\" Chest<br>4XL - 62\" Chest<br>5XL - 66\" Chest",
+    "T-Shirt": "Small – 34/36\"<br>Medium – 38/40\"<br>Large – 42/44\"<br>XL – 46/48\"<br>2XL – 50/52\"<br>3XL – 54/56\"<br>4XL – 58/60\"",
+    "Adult Sweatshirt": "Small – 36\" Chest<br>Medium – 40\" Chest<br>Large – 44\" Chest<br>XL – 48\" Chest<br>2XL – 52\" Chest<br>3XL – 56\" Chest",
+    "Adult Hoodie": "Small – 36\" Chest<br>Medium – 40\" Chest<br>Large – 44\" Chest<br>XL – 48\" Chest<br>2XL – 52\" Chest<br>3XL – 56\" Chest",
+    "Ladies Shirt": "Small – UK 6/8<br>Medium – UK 8/10<br>Large – UK 12<br>XL – UK 14<br>2XL – UK 16",
+    "Longsleeve T-Shirt": "Small – 34/36\"<br>Medium – 38/40\"<br>Large – 42/44\"<br>XL – 46/48\"<br>2XL – 50/52\"",
+    "Tank-Top": "Small – 34/36\"<br>Medium – 38/40\"<br>Large – 42/44\"<br>XL – 46/48\"<br>2XL – 50/52\"",
+    "kids t shirt": "3–4 Y (104 cm)<br>5–6 Y (116 cm)<br>7–8 Y (128 cm)<br>9–11 Y (140 cm)<br>12–13 Y (152 cm)",
+    "kids sweatshirt": "3–4 Y (104 cm)<br>5–6 Y (116 cm)<br>7–8 Y (128 cm)<br>9–11 Y (140 cm)<br>12–13 Y (152 cm)",
+    "kids hoodie": "3–4 Y (104 cm)<br>5–6 Y (116 cm)<br>7–8 Y (128 cm)<br>9–11 Y (140 cm)<br>12–13 Y (152 cm)"
 }
 
+# --- Product Configuration ---
 product_types = {
-    "kids t shirt": {"sizes": ["3-4 Years", "5-6 Years"], "price": 14.99},
-    # ... add rest
+    "T-Shirt": {"sizes": ["Small", "Medium", "Large", "XL", "2XL", "3XL"], "price": 12.99},
+    "Adult Hoodie": {
+        "sizes": ["Small", "Medium", "Large", "XL", "2XL", "3XL"],
+        "price_by_size": {"Small": 28.99, "Medium": 28.99, "Large": 28.99, "XL": 28.99, "2XL": 30.99, "3XL": 30.99}
+    },
+    "Adult Sweatshirt": {
+        "sizes": ["Small", "Medium", "Large", "XL", "2XL", "3XL"],
+        "price_by_size": {"Small": 23.99, "Medium": 23.99, "Large": 23.99, "XL": 23.99, "2XL": 24.99, "3XL": 24.99}
+    },
+    "Ladies Shirt": {"sizes": ["Small", "Medium", "Large", "XL", "2XL"], "price": 16.99},
+    "Tank-Top": {"sizes": ["Small", "Medium", "Large", "XL", "2XL"], "price": 15.99},
+    "Longsleeve T-Shirt": {"sizes": ["Small", "Medium", "Large", "XL", "2XL"], "price": 16.99},
+    "Oversized T Shirts": {
+        "sizes": ["XS", "Small", "Medium", "Large", "XL", "2XL", "3XL", "4XL", "5XL"],
+        "price_by_size": {
+            "XS": 24.99, "Small": 24.99, "Medium": 24.99, "Large": 24.99, "XL": 24.99,
+            "2XL": 24.99, "3XL": 25.99, "4XL": 25.99, "5XL": 25.99
+        }
+    },
+    "kids t shirt": {"sizes": ["3-4 Years", "5-6 Years", "7-8 Years", "9-11 Years", "12-13 Years"], "price": 14.99},
+    "kids hoodie": {"sizes": ["3-4 Years", "5-6 Years", "7-8 Years", "9-11 Years", "12-13 Years"], "price": 25.99},
+    "kids sweatshirt": {"sizes": ["3-4 Years", "5-6 Years", "7-8 Years", "9-11 Years", "12-13 Years"], "price": 22.99}
 }
 
 correct_colors_by_type = {
+    "T-Shirt": ["Black", "White"],
+    "Adult Hoodie": ["Black", "Grey", "White"],
+    "Adult Sweatshirt": ["Black", "Grey"],
+    "Ladies Shirt": ["Black", "Pink", "White"],
+    "Tank-Top": ["Black", "White"],
+    "Longsleeve T-Shirt": ["Black", "White"],
+    "Oversized T Shirts": ["Black", "White", "Pink"],
     "kids t shirt": ["White", "Kelly", "Navy"],
-    # ... add rest
+    "kids hoodie": ["White", "Grey"],
+    "kids sweatshirt": ["White", "Grey"]
 }
 
 # --- Process form submission ---
 if submit:
-    if sku_suffix in used_suffixes:
+    desc_list = [d.strip() for d in raw_descriptions.split('|') if d.strip()]
+    if len(desc_list) != len(garment_keys):
+        st.error(f"❌ You provided {len(desc_list)} descriptions but {len(garment_keys)} are required.")
+    elif sku_suffix in used_suffixes:
         st.error("❌ That SKU suffix is already used. Please enter a new one.")
-    elif not all([product_name, sku_suffix, main_color, tags]):
+    elif not all([product_name, sku_suffix, main_color, tags, lister]):
         st.warning("⚠️ Please complete all fields.")
     else:
+        descriptions = {
+            garment: f"{desc}<br><br>{body_html_map[garment]}"
+            for garment, desc in zip(garment_keys, desc_list)
+        }
+
         rows = []
         for garment_type, config in product_types.items():
             sizes = config["sizes"]
@@ -73,7 +147,7 @@ if submit:
                 rows.append({
                     "Handle": handle,
                     "Title": title,
-                    "Body (HTML)": body_html_map.get(garment_type, ""),
+                    "Body (HTML)": descriptions[garment_type],
                     "Vendor": vendor,
                     "Type": garment_type,
                     "Tags": tags,
@@ -97,8 +171,13 @@ if submit:
         filename = f"{handle}.xlsx"
         df.to_excel(filename, index=False)
 
-        # Save suffix
-        pd.DataFrame([{"sku_suffix": sku_suffix}]).to_csv(
+        # Save suffix + lister + timestamp
+        log_df = pd.DataFrame([{ 
+            "sku_suffix": sku_suffix, 
+            "lister": lister, 
+            "timestamp": datetime.now().isoformat()
+        }])
+        log_df.to_csv(
             SKU_TRACKER_FILE,
             mode='a',
             header=not os.path.exists(SKU_TRACKER_FILE),
@@ -110,3 +189,6 @@ if submit:
 
         st.success("✅ Excel generated! Ready to download.")
 
+        # Optional preview
+        st.subheader("Preview")
+        st.dataframe(df.head())
