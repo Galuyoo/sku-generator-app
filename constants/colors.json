@@ -1,0 +1,96 @@
+{
+  "Ringer T-Shirt": ["Black", "Blue", "Red", "Navy"],
+  "Raglan T-Shirt": ["Black", "Navy", "Blue", "Red"],
+  "T Shirt": [
+    "Black",
+    "Heather Grey",
+    "Kelly",
+    "Navy",
+    "Red",
+    "Royal",
+    "White"
+  ],
+  "Hoodie": [
+    "Black",
+    "Heather Grey",
+    "Navy",
+    "Kelly",
+    "Red",
+    "Royal",
+    "White"
+  ],
+  "Sweatshirt": [
+    "Black",
+    "Kelly",
+    "Navy",
+    "Royal",
+    "Red",
+    "Sky",
+    "White",
+    "Heather Grey"
+  ],
+  "Ladies Shirt": [
+    "Black",
+    "Red",
+    "Heather Grey",
+    "Navy",
+    "Kelly",
+    "Royal",
+    "White"
+  ],
+  "Tank-Top": [
+    "Black",
+    "White",
+    "Royal",
+    "Red",
+    "Navy",
+    "Heather Grey",
+    "Kelly"
+  ],
+  "Longsleeve T-Shirt": [
+    "Black",
+    "Navy",
+    "Kelly",
+    "Red",
+    "Royal",
+    "White",
+    "Heather Grey"
+  ],
+  "Oversized T Shirts": [
+    "Black",
+    "White",
+    "Vintage Blue",
+    "City Red",
+    "Intense Blue",
+    "Hibiskus Hot Pink",
+    "Dark Grey",
+    "Retro Green"
+  ],
+  "Kids T Shirt": [
+    "Black",
+    "White",
+    "Kelly",
+    "Navy",
+    "Red",
+    "Royal",
+    "Heather Grey"
+  ],
+  "Kids Hoodie": [
+    "Black",
+    "Heather Grey",
+    "Navy",
+    "White",
+    "Red",
+    "Royal",
+    "Kelly"
+  ],
+  "Kids Sweatshirt": [
+    "Black",
+    "White",
+    "Heather Grey",
+    "Kelly",
+    "Navy",
+    "Red",
+    "Royal"
+  ]
+}

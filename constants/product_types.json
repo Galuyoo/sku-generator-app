@@ -1,0 +1,142 @@
+{
+  "Ringer T-Shirt": {
+    "sizes": ["Small", "Medium", "Large", "XL", "2XL"],
+    "price": 17.99
+  },
+  "Raglan T-Shirt": {
+    "sizes": ["Small", "Medium", "Large", "XL", "2XL", "3XL"],
+    "price": 17.99
+  },
+  "T Shirt": {
+    "sizes": [
+      "Small",
+      "Medium",
+      "Large",
+      "XL",
+      "2XL",
+      "3XL",
+      "4XL"
+    ],
+    "price": 16.99
+  },
+  "Hoodie": {
+    "sizes": [
+      "Small",
+      "Medium",
+      "Large",
+      "XL",
+      "2XL",
+      "3XL"
+    ],
+    "price_by_size": {
+      "Small": 28.99,
+      "Medium": 28.99,
+      "Large": 28.99,
+      "XL": 28.99,
+      "2XL": 30.99,
+      "3XL": 30.99
+    }
+  },
+  "Sweatshirt": {
+    "sizes": [
+      "Small",
+      "Medium",
+      "Large",
+      "XL",
+      "2XL",
+      "3XL"
+    ],
+    "price_by_size": {
+      "Small": 23.99,
+      "Medium": 23.99,
+      "Large": 23.99,
+      "XL": 23.99,
+      "2XL": 24.99,
+      "3XL": 24.99
+    }
+  },
+  "Ladies Shirt": {
+    "sizes": [
+      "Small",
+      "Medium",
+      "Large",
+      "XL",
+      "2XL"
+    ],
+    "price": 16.99
+  },
+  "Tank-Top": {
+    "sizes": [
+      "Small",
+      "Medium",
+      "Large",
+      "XL",
+      "2XL"
+    ],
+    "price": 15.99
+  },
+  "Longsleeve T-Shirt": {
+    "sizes": [
+      "Small",
+      "Medium",
+      "Large",
+      "XL",
+      "2XL"
+    ],
+    "price": 16.99
+  },
+  "Oversized T Shirts": {
+    "sizes": [
+      "XS",
+      "Small",
+      "Medium",
+      "Large",
+      "XL",
+      "2XL",
+      "3XL",
+      "4XL",
+      "5XL"
+    ],
+    "price_by_size": {
+      "XS": 24.99,
+      "Small": 24.99,
+      "Medium": 24.99,
+      "Large": 24.99,
+      "XL": 24.99,
+      "2XL": 24.99,
+      "3XL": 25.99,
+      "4XL": 25.99,
+      "5XL": 25.99
+    }
+  },
+  "Kids T Shirt": {
+    "sizes": [
+      "3-4 Years",
+      "5-6 Years",
+      "7-8 Years",
+      "9-11 Years",
+      "12-13 Years"
+    ],
+    "price": 14.99
+  },
+  "Kids Hoodie": {
+    "sizes": [
+      "3-4 Years",
+      "5-6 Years",
+      "7-8 Years",
+      "9-11 Years",
+      "12-13 Years"
+    ],
+    "price": 25.99
+  },
+  "Kids Sweatshirt": {
+    "sizes": [
+      "3-4 Years",
+      "5-6 Years",
+      "7-8 Years",
+      "9-11 Years",
+      "12-13 Years"
+    ],
+    "price": 22.99
+  }
+}
