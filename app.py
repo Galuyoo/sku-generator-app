@@ -79,7 +79,12 @@ def _render_downloads(key: str, title: str, zip_name_prefix: str = "FILES"):
 st.set_page_config(page_title="SKU Generator", layout="centered")
 
 # ---------- Env / validation ----------
-load_dotenv("dpbox.env")
+# Load .env automatically (default)
+load_dotenv()
+
+# Optional fallback for legacy file name
+if not os.getenv("DROPBOX_REFRESH_TOKEN"):
+    load_dotenv("dpbox.env")
 
 FINISHED_DIR_NAME = os.getenv("FINISHED_DIR_NAME", "finished")
 COMPLETED_ROOT = os.getenv(
