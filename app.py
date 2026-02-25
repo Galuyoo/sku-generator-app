@@ -500,10 +500,20 @@ with tab_manual:
                         st.error(f"Unexpected error: {e}")
 
             with st.expander("📝 Preview Descriptions"):
+                key_col = "Base Type" if "Base Type" in df.columns else "Type"
+
                 for garment in garment_keys:
                     st.markdown(f"**{garment}**", unsafe_allow_html=True)
-                    st.markdown(df[df["Type"] == garment].iloc[0]["Body (HTML)"], unsafe_allow_html=True)
+
+                    sub = df[df[key_col] == garment]
+                    if sub.empty:
+                        st.warning(f"No rows found for '{garment}' (preview only).")
+                        st.markdown("---")
+                        continue
+
+                    st.markdown(sub.iloc[0]["Body (HTML)"], unsafe_allow_html=True)
                     st.markdown("---")
+                    
         except Exception as e:
             st.error("❌ Something went wrong while generating the CSV.")
             st.exception(e)
