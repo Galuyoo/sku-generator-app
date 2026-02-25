@@ -41,3 +41,4 @@ reports/
 
 # Data files (optional — only if you don't want them in git)
 *.csv
+.logo.png
