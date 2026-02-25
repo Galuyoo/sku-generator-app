@@ -312,7 +312,6 @@ def ensure_shopify_csv_fields(df: pd.DataFrame) -> pd.DataFrame:
 def build_design_dataframe(dbx: dropbox.Dropbox, folder: str, excluded_colors: list[str] = None):
     folder_path = f"{DESIGNS_ROOT}/{folder}"
     meta = download_metadata(dbx, folder_path)
-    collection = meta.get("Collection", "").strip() or None
 
 
     # --- NEW: extract Restrictions field ---
@@ -359,7 +358,6 @@ def build_design_dataframe(dbx: dropbox.Dropbox, folder: str, excluded_colors: l
         inventory_tracker=inventory_tracker,
         image_links=image_links,
         excluded_colors=excluded_colors,
-        collection=collection,
         page_titles=page_titles
     )
     df = ensure_image_src_column(df)
@@ -471,7 +469,7 @@ with tab_manual:
                 garment_keys, desc_list,
                 body_html_map, product_extras, product_types, correct_colors_by_type,
                 vendor, published, inventory_policy, fulfillment_service, requires_shipping, taxable, inventory_tracker,
-                image_links=image_links,excluded_colors=excluded_colors,collection=collection
+                image_links=image_links,excluded_colors=excluded_colors,
             )
 
             # >>> Your requested CSV fields <<<

@@ -11,7 +11,6 @@ def generate_sku_dataframe(
     vendor, published, inventory_policy, fulfillment_service, requires_shipping, taxable, inventory_tracker,
     image_links=None,
     excluded_colors: list[str] = None,
-    collection: str = None,
     page_titles: list[str] = None,
 ):
     def generate_alt_text(title):
@@ -127,7 +126,6 @@ def generate_sku_dataframe(
                 "Variant Price": price,
                 "Variant Requires Shipping": requires_shipping,
                 "Variant Taxable": taxable,
-                "Collection": collection or "",
             })
 
     df = pd.DataFrame(rows)
