@@ -51,8 +51,8 @@ def generate_sku_dataframe(
         sizes = config["sizes"]
         colors = correct_colors_by_type[base_type]
 
-        # Handle color renaming for Oversized T Shirts
-        if base_type == "Oversized T Shirts":
+        # Handle color renaming for Oversized T-Shirt
+        if base_type == "Oversized T-Shirt":
             equivalents = {
                 "Pink": "Hibiskus Pink",
                 "Grey": "Dark Grey",
@@ -79,7 +79,7 @@ def generate_sku_dataframe(
         colors = [c for c in colors if c.lower() not in [ex.lower() for ex in excluded_colors]]
 
         for size, color in product(sizes, colors):
-            if base_type == "Oversized T Shirts" and color == "Pink":
+            if base_type == "Oversized T-Shirt" and color == "Pink":
                 continue
 
             price = config.get("price_by_size", {}).get(size, config.get("price"))
@@ -96,10 +96,10 @@ def generate_sku_dataframe(
             handle = handle.replace("-bootleg", "").replace("-adult", "")
 
             sku_prefix_map = {
-                "T Shirt": "UC301", "Hoodie": "JH1001", "Sweatshirt": "JH030",
-                "Ladies Shirt": "5000L", "Tank-Top": "JD012", "Longsleeve T-Shirt": "JD011",
-                "Oversized T Shirts": "BY102", "Kids T Shirt": "T06", "Kids Hoodie": "JH01J",
-                "Kids Sweatshirt": "JH30J", "Ringer T-Shirt": "JH300", "Raglan T-Shirt": "JH400",
+                "T Shirt": "UC301", "Hoodie": "JH001", "Sweatshirt": "JH030",
+                "Ladies T-Shirt": "5000L", "Tank-Top": "GD012", "Longsleeve T-Shirt": "ST01",
+                "Oversized T-Shirt": "BY102", "Kids T-Shirt": "T06", "Kids Hoodie": "JH01J",
+                "Kids Sweatshirt": "JH30J", "Ringer T-Shirt": "SS168", "Raglan T-Shirt": "SS026",
             }
             sku = f"{sku_prefix_map.get(base_type, 'SKU')}-{size}-{color.replace(' ', '')}-{sku_suffix}"
 

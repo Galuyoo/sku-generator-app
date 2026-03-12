@@ -55,7 +55,7 @@
       "3XL": 24.99
     }
   },
-  "Ladies Shirt": {
+  "Ladies T-Shirt": {
     "sizes": [
       "Small",
       "Medium",
@@ -85,7 +85,7 @@
     ],
     "price": 16.99
   },
-  "Oversized T Shirts": {
+  "Oversized T-Shirt": {
     "sizes": [
       "XS",
       "Small",
@@ -109,7 +109,7 @@
       "5XL": 25.99
     }
   },
-  "Kids T Shirt": {
+  "Kids T-Shirt": {
     "sizes": [
       "3-4 Years",
       "5-6 Years",

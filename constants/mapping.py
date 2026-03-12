@@ -154,7 +154,7 @@ HARD_CODED_IMAGE_MAPPING = {
         "Black": 46,
         "Heather Grey": 47
     },
-    "Ladies Shirt": {
+    "Ladies T-Shirt": {
         "Red": 66,
         "Black": 67,
         "Heather Grey": 68,
@@ -181,7 +181,7 @@ HARD_CODED_IMAGE_MAPPING = {
         "Black": 38,
         "Heather Grey": 39
     },
-    "Oversized T Shirts": {
+    "Oversized T-Shirt": {
         "Black": 73,
         "White": 74,
         "Vintage Blue": 75,
@@ -191,7 +191,7 @@ HARD_CODED_IMAGE_MAPPING = {
         "Dark Grey": 79,
         "City Red": 80
     },
-    "Kids T Shirt": {
+    "Kids T-Shirt": {
         "White": 1,
         "Kelly": 2,
         "Navy": 3,
@@ -222,11 +222,11 @@ HARD_CODED_IMAGE_MAPPING = {
 
 
 CATEGORY_MAP = {
-    "Kids T Shirt": "T-Shirts in Clothing Tops",
-    "Oversized T Shirts": "T-Shirts in Clothing Tops",
+    "Kids T-Shirt": "T-Shirts in Clothing Tops",
+    "Oversized T-Shirt": "T-Shirts in Clothing Tops",
     "Longsleeve T-Shirt": "T-Shirts in Clothing Tops",
     "Tank-Top": "Tank Tops",
-    "Ladies Shirt": "T-Shirts in Clothing Tops",
+    "Ladies T-Shirt": "T-Shirts in Clothing Tops",
     "Sweatshirt": "Sweatshirts in Clothing Tops",
     "Kids Sweatshirt": "Sweatshirts in Clothing Tops",
     "Hoodie": "Hoodies in Clothing Tops",
