@@ -102,10 +102,22 @@ def _profile(label, url_env, token_env):
     return {"label": label, "url": url, "token": token}
 
 STORE_PROFILES = []
-test_p = _profile("Galuyoo (test)", "SHOPIFY_STORE_URL_TEST", "SHOPIFY_API_PASSWORD_TEST")
+test_p = _profile(
+    "Galuyoo (test)",
+    "SHOPIFY_STORE_URL_TEST",
+    "SHOPIFY_ACCESS_TOKEN_TEST"
+)
+if not test_p["token"]:
+    test_p["token"] = (os.getenv("SHOPIFY_API_PASSWORD_TEST") or "").strip()
 if test_p["url"] and test_p["token"]:
     STORE_PROFILES.append(test_p)
-prod_p = _profile("Spoofytees (prod)", "SHOPIFY_STORE_URL_PROD", "SHOPIFY_API_PASSWORD_PROD")
+prod_p = _profile(
+    "Spoofytees (prod)",
+    "SHOPIFY_STORE_URL_PROD",
+    "SHOPIFY_ACCESS_TOKEN_PROD"
+)
+if not prod_p["token"]:
+    prod_p["token"] = (os.getenv("SHOPIFY_API_PASSWORD_PROD") or "").strip()
 if prod_p["url"] and prod_p["token"]:
     STORE_PROFILES.append(prod_p)
 
@@ -151,16 +163,13 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Check failed: {e}")
 
-REQUIRED_ENV = [
-    "GOOGLE_KEYFILE",
-    "DROPBOX_APP_KEY",
-    "DROPBOX_APP_SECRET",
-    "DROPBOX_REFRESH_TOKEN",
-    "FOLDER_PATH",
-]
-missing = [k for k in REQUIRED_ENV if not os.getenv(k)]
-if missing:
-    st.warning(f"Environment missing: {', '.join(missing)}. Image mapping will be disabled until fixed.")
+HAS_GOOGLE_CONFIG = bool((os.getenv("GOOGLE_KEYFILE") or "").strip())
+HAS_DROPBOX_CONFIG = all([
+    (os.getenv("DROPBOX_APP_KEY") or "").strip(),
+    (os.getenv("DROPBOX_APP_SECRET") or "").strip(),
+    (os.getenv("DROPBOX_REFRESH_TOKEN") or "").strip(),
+    (os.getenv("FOLDER_PATH") or "").strip(),
+])
 
 FOLDER_PATH  = os.getenv("FOLDER_PATH", "").strip()
 DESIGNS_ROOT = os.getenv("FOLDER_PATH_Design", "").strip()
@@ -381,30 +390,33 @@ st.title("🧵 SKU Generator for Shopify")
 if not st.session_state.generating:
     with st.sidebar:
         st.header("🖼️ Dropbox Image Loader (Manual tab)")
-        if st.button("🔄 Get / Refresh Image Links"):
-            try:
-                dbx = get_dropbox_client()
-                with st.spinner("⏳ Fetching image links from Dropbox..."):
-                    links, failed = load_dropbox_image_links(dbx, FOLDER_PATH, total_images=80)
-                st.session_state.dropbox_image_links = links
-                st.session_state.dropbox_links_loaded = (len(links) == 80 and len(failed) == 0)
-                if st.session_state.dropbox_links_loaded:
-                    st.success("✅ Dropbox image links loaded successfully.")
-                else:
-                    st.warning(f"Loaded {len(links)} images. Missing: {len(failed)}.")
-            except Exception as e:
-                st.session_state.dropbox_links_loaded = False
-                st.error("Failed to load Dropbox image links.")
-                st.exception(e)
+        if not HAS_DROPBOX_CONFIG:
+            st.caption("Dropbox features are disabled because Dropbox is not configured.")
+        else:
+            if st.button("🔄 Get / Refresh Image Links"):
+                try:
+                    dbx = get_dropbox_client()
+                    with st.spinner("⏳ Fetching image links from Dropbox..."):
+                        links, failed = load_dropbox_image_links(dbx, FOLDER_PATH, total_images=80)
+                    st.session_state.dropbox_image_links = links
+                    st.session_state.dropbox_links_loaded = (len(links) == 80 and len(failed) == 0)
+                    if st.session_state.dropbox_links_loaded:
+                        st.success("✅ Dropbox image links loaded successfully.")
+                    else:
+                        st.warning(f"Loaded {len(links)} images. Missing: {len(failed)}.")
+                except Exception as e:
+                    st.session_state.dropbox_links_loaded = False
+                    st.error("Failed to load Dropbox image links.")
+                    st.exception(e)
 
-        if st.session_state.dropbox_links_loaded:
-            img_num = st.number_input("Image # to Preview", 1, 80, value=1)
-            url = st.session_state.dropbox_image_links.get(int(img_num))
-            if url:
-                st.markdown("### 🎨 Preview")
-                st.markdown(f'<img src="{url}" style="width:100%; border-radius:10px;" />', unsafe_allow_html=True)
-            else:
-                st.warning("No URL for that image number.")
+            if st.session_state.dropbox_links_loaded:
+                img_num = st.number_input("Image # to Preview", 1, 80, value=1)
+                url = st.session_state.dropbox_image_links.get(int(img_num))
+                if url:
+                    st.markdown("### 🎨 Preview")
+                    st.markdown(f'<img src="{url}" style="width:100%; border-radius:10px;" />', unsafe_allow_html=True)
+                else:
+                    st.warning("No URL for that image number.")
 
 # ---------- Shopify defaults ----------
 vendor = shopify_defaults["vendor"]
@@ -460,6 +472,9 @@ with tab_manual:
                 st.warning("⚠️ Please complete all fields.")
                 st.stop()
 
+            if not HAS_GOOGLE_CONFIG:
+                st.warning("Google Sheets SKU guard is unavailable because GOOGLE_KEYFILE is not configured.")
+                st.stop()
             sheet = connect_to_sheet("SKU Tracker")
             existing_suffixes = [row[0].strip().upper() for row in sheet.get_all_values()[1:]]
             if sku_suffix in existing_suffixes:
@@ -622,6 +637,10 @@ def clean_and_archive_to_completed(dbx: dropbox.Dropbox, folder: str) -> tuple[i
 with tab_auto:
     st.subheader("Auto-generate from Dropbox design folders")
 
+    if not HAS_DROPBOX_CONFIG:
+        st.info("Dropbox is not configured, so this tab is disabled.")
+        st.stop()
+
     if not DESIGNS_ROOT:
         st.warning("Set `FOLDER_PATH_Design` in dpbox.env to your `/designs` root to use this tab.")
         st.stop()
@@ -707,6 +726,9 @@ with tab_auto:
                 s.write("✅ DataFrame ready")
 
                 if do_google_guard:
+                    if not HAS_GOOGLE_CONFIG:
+                        st.warning("Google Sheets SKU guard is unavailable because GOOGLE_KEYFILE is not configured.")
+                        st.stop()
                     sheet = connect_to_sheet("SKU Tracker")
                     existing = [row[0].strip().upper() for row in sheet.get_all_values()[1:]]
                     sku_suffix = meta.get("sku_suffix","").strip().upper()
@@ -760,6 +782,9 @@ with tab_auto:
             meta = st.session_state.auto_meta
 
             if do_google_guard:
+                if not HAS_GOOGLE_CONFIG:
+                    st.warning("Google Sheets SKU guard is unavailable because GOOGLE_KEYFILE is not configured.")
+                    st.stop()
                 sheet = connect_to_sheet("SKU Tracker")
                 existing = [row[0].strip().upper() for row in sheet.get_all_values()[1:]]
                 sku_suffix = meta.get("sku_suffix","").strip().upper()
@@ -880,6 +905,9 @@ with tab_auto:
                     s.write("✅ DataFrame ready")
 
                     if do_google_guard:
+                        if not HAS_GOOGLE_CONFIG:
+                            st.warning("Google Sheets SKU guard is unavailable because GOOGLE_KEYFILE is not configured.")
+                            st.stop()
                         sheet = connect_to_sheet("SKU Tracker")
                         existing = [row[0].strip().upper() for row in sheet.get_all_values()[1:]]
                         sku_suffix = meta.get("sku_suffix","").strip().upper()
