@@ -24,6 +24,8 @@ from utils.dropbox_utils import (
 from utils.ui_utils import render_logo
 from utils.shopify_utils import upload_products_from_df, ShopifyError
 from utils.dropbox_utils import load_dropbox_image_links_parallel as load_dropbox_image_links
+from utils.local_designs import analyze_local_design_folders
+from utils.design_bundle import build_local_canva_bundle
 
 import io, zipfile
 
@@ -186,6 +188,8 @@ if "auto_df" not in st.session_state: st.session_state.auto_df = None
 if "auto_csv_name" not in st.session_state: st.session_state.auto_csv_name = None
 if "auto_folder" not in st.session_state: st.session_state.auto_folder = None
 if "auto_meta" not in st.session_state: st.session_state.auto_meta = None
+if "local_ready_folders" not in st.session_state: st.session_state.local_ready_folders = []
+if "local_not_ready_folders" not in st.session_state: st.session_state.local_not_ready_folders = []
 
 # ---------- Small helpers ----------
 def analyze_design_folders(dbx: dropbox.Dropbox, root: str):
@@ -445,7 +449,7 @@ excluded_colors = st.multiselect(
 
 
 # ---------- Tabs ----------
-tab_manual, tab_auto = st.tabs(["📝 Manual entry", "🤖 Auto from Dropbox"])
+tab_manual, tab_local, tab_auto = st.tabs(["📝 Manual entry", "📁 Local + Canva", "🤖 Auto from Dropbox"])
 
 # =========================
 # Tab 1: Manual entry
@@ -540,6 +544,53 @@ with tab_manual:
         finally:
             st.session_state.generating = False
 
+# =========================
+# Tab 2: Local + Canva
+# =========================
+with tab_local:
+    st.subheader("Analyze local staging folders")
+    local_staging_root = st.text_input("Local staging root path")
+
+    if st.button("Analyze local staging folders"):
+        try:
+            ready, not_ready = analyze_local_design_folders(local_staging_root)
+            st.session_state.local_ready_folders = ready
+            st.session_state.local_not_ready_folders = not_ready
+        except Exception as e:
+            st.error(f"Failed to analyze local staging folders: {e}")
+
+    if st.session_state.local_ready_folders:
+        st.markdown("### Ready folders")
+        st.write(st.session_state.local_ready_folders)
+    else:
+        st.info("No ready local staging folders found.")
+
+    if st.session_state.local_not_ready_folders:
+        st.markdown("### Not ready folders")
+        st.dataframe(pd.DataFrame(st.session_state.local_not_ready_folders), use_container_width=True)
+
+    if st.session_state.local_ready_folders:
+        selected_local_folder = st.selectbox("Choose a ready local folder", st.session_state.local_ready_folders)
+        sku_override = st.text_input("SKU override (optional)").strip()
+
+        if st.button("Build Local + Canva Bundle"):
+            try:
+                selected_folder_path = os.path.join(local_staging_root, selected_local_folder)
+                bundle = build_local_canva_bundle(
+                    selected_folder_path,
+                    sku=sku_override or None,
+                )
+                st.markdown("### Bundle inspection")
+                st.write({"display_name": bundle.display_name, "source_kind": bundle.source_kind, "source_id": bundle.source_id})
+                if bundle.preview_asset:
+                    st.write({"preview_asset": bundle.preview_asset})
+                st.write({"metadata": bundle.metadata})
+                st.write({"image_link_count": len(bundle.image_links)})
+                st.write({"image_link_sample": dict(list(bundle.image_links.items())[:5])})
+                st.write({"missing_images": bundle.missing_images})
+            except Exception as e:
+                st.error(f"Failed to build local Canva bundle: {e}")
+
 # ------------------------------------------------------------
 # Helpers for Auto tab
 # ------------------------------------------------------------
@@ -632,7 +683,7 @@ def clean_and_archive_to_completed(dbx: dropbox.Dropbox, folder: str) -> tuple[i
     return deleted, dest
 
 # =========================
-# Tab 2: Auto from Dropbox
+# Tab 3: Auto from Dropbox
 # =========================
 with tab_auto:
     st.subheader("Auto-generate from Dropbox design folders")

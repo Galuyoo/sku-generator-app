@@ -10,7 +10,7 @@ logs/
 coverage/
 .cache/
 .tmp/
-
+            
 
 # Envs & secrets
 .env
@@ -42,3 +42,5 @@ reports/
 # Data files (optional — only if you don't want them in git)
 *.csv
 .logo.png
+
+canva.json
