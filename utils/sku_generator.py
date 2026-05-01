@@ -89,11 +89,11 @@ def generate_sku_dataframe(
             seo_title_value = seo_title_map.get(base_type, base_title)
 
             # ✅ Clean handle (Shopify slug)
-            handle = re.sub(
-                r"[^\w\s-]", "",
-                seo_title_value.split("|")[0].strip().lower()
-            ).replace(" ", "-")
-            handle = handle.replace("-bootleg", "").replace("-adult", "")
+            handle_source = base_title
+
+            handle = re.sub(r"[^\w\s-]", "", handle_source.strip().lower())
+            handle = re.sub(r"\s+", "-", handle)
+            handle = re.sub(r"-+", "-", handle).strip("-")
 
             sku_prefix_map = {
                 "T Shirt": "UC301", "Hoodie": "JH001", "Sweatshirt": "JH030",

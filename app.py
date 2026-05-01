@@ -16,6 +16,12 @@ from constants.config import shopify_defaults
 from constants.data_loader import load_json
 from utils.sku_generator import generate_sku_dataframe
 from utils.google_utils import connect_to_sheet
+from utils.listing_validation import (
+    combine_validation_results,
+    has_validation_errors,
+    validate_listing_metadata,
+    validate_shopify_dataframe,
+)
 from utils.dropbox_utils import (
     get_dropbox_client,
     get_shared_link,     # used for art preview
@@ -135,33 +141,33 @@ def download_metadata(dbx: dropbox.Dropbox, folder_path: str) -> dict:
         raise RuntimeError(f"Error accessing {folder_path}: {e}")
 
 
-def _metadata_issues(meta: dict) -> tuple[list[str], str]:
-    issues = []
+def _listing_min_tag_count() -> int:
+    try:
+        return max(0, int(os.getenv("LISTING_MIN_TAG_COUNT", "6")))
+    except ValueError:
+        return 6
 
-    product_name = (meta.get("product_name") or "").strip()
-    sku_suffix = (meta.get("sku_suffix") or "").strip().upper()
-    main_color = (meta.get("main_color") or "").strip()
+
+def _validate_metadata_for_listing(meta: dict, label: str | None = None) -> dict:
+    return validate_listing_metadata(
+        meta,
+        expected_item_count=len(garment_keys),
+        min_tag_count=_listing_min_tag_count(),
+        label=label,
+    )
+
+
+def _metadata_issues(meta: dict) -> tuple[list[str], str]:
     descriptions = meta.get("descriptions", [])
 
-    if not product_name:
-        issues.append("Missing product_name in metadata.json")
-    if not sku_suffix:
-        issues.append("Missing sku_suffix in metadata.json")
-    if not main_color:
-        issues.append("Missing main_color in metadata.json")
-
     if not isinstance(descriptions, list):
-        issues.append("metadata.json 'descriptions' must be a list")
         descriptions_count_label = "invalid"
     else:
         descriptions_count = len([d for d in descriptions if str(d).strip()])
         descriptions_count_label = f"{descriptions_count} / {len(garment_keys)}"
-        if descriptions_count != len(garment_keys):
-            issues.append(
-                f"Descriptions incomplete: found {descriptions_count}/{len(garment_keys)} required entries"
-            )
 
-    return issues, descriptions_count_label
+    validation = _validate_metadata_for_listing(meta)
+    return validation["errors"], descriptions_count_label
 
 def _stash_downloads(key: str, files: list[tuple[str, bytes]]):
     """
@@ -209,6 +215,49 @@ def _render_downloads(key: str, title: str, zip_name_prefix: str = "FILES"):
     if st.button("🧹 Clear Downloads", key=f"{key}_clear"):
         del st.session_state[key]
         st.experimental_rerun()
+
+
+def _format_validation_errors(validation: dict, limit: int = 5) -> str:
+    errors = validation.get("errors", [])
+    shown = "; ".join(errors[:limit])
+    remaining = len(errors) - limit
+    if remaining > 0:
+        return f"{shown}; +{remaining} more"
+    return shown
+
+
+def _render_listing_safety_checks(validation: dict, *, expanded: bool = False) -> None:
+    errors = validation.get("errors", [])
+    warnings = validation.get("warnings", [])
+    summary = validation.get("summary", {})
+
+    with st.expander("Listing safety checks", expanded=expanded or bool(errors) or bool(warnings)):
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Errors", len(errors))
+        col2.metric("Warnings", len(warnings))
+        col3.metric("Products checked", summary.get("products_checked", 0))
+        col4.metric("Rows checked", summary.get("rows_checked", 0))
+
+        metadata_checked = summary.get("metadata_files_checked", 0)
+        if metadata_checked:
+            st.caption(f"Metadata files checked: {metadata_checked}")
+
+        if errors:
+            st.error("Fix listing safety errors before download, export, or upload.")
+        elif warnings:
+            st.warning("Listing checks passed with warnings. Export is allowed.")
+        else:
+            st.success("Listing checks passed")
+
+        if errors:
+            st.markdown("**Errors**")
+            for item in errors:
+                st.write(f"- {item}")
+
+        if warnings:
+            st.markdown("**Warnings**")
+            for item in warnings:
+                st.write(f"- {item}")
 
 
 # ---------- Streamlit config ----------
@@ -315,6 +364,7 @@ if "auto_df" not in st.session_state: st.session_state.auto_df = None
 if "auto_csv_name" not in st.session_state: st.session_state.auto_csv_name = None
 if "auto_folder" not in st.session_state: st.session_state.auto_folder = None
 if "auto_meta" not in st.session_state: st.session_state.auto_meta = None
+if "auto_validation" not in st.session_state: st.session_state.auto_validation = None
 
 # ---------- Small helpers ----------
 def ensure_image_src_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -378,9 +428,10 @@ def build_design_dataframe(
     folder: str,
     excluded_colors: list[str] = None,
     mockup_source: str = "Dropbox",
+    metadata: dict | None = None,
 ):
     folder_path = f"{DESIGNS_ROOT}/{folder}" if folder else None
-    meta = download_metadata(dbx, folder_path)
+    meta = metadata if metadata is not None else download_metadata(dbx, folder_path)
 
     restrictions = meta.get("Restrictions", "")
     if restrictions:
@@ -551,29 +602,35 @@ with tab_manual:
             # >>> Your requested CSV fields <<<
             df = ensure_shopify_csv_fields(df)
 
-            filename = f"{sku_suffix}.csv"
-            df.to_csv(filename, index=False, encoding="utf-8-sig")
-            with open(filename, "rb") as f:
-                st.download_button("📥 Download CSV File", f, file_name=filename)
+            csv_validation = validate_shopify_dataframe(df, label=sku_suffix)
+            _render_listing_safety_checks(csv_validation)
 
-            if st.button("Send to Shopify"):
-                with st.status("🚀 Uploading to Shopify…", expanded=True) as s:
-                    try:
-                        def emit(msg: str): s.write(msg)
-                        results = upload_products_from_df(df, progress=emit)
-                        s.update(label="✅ Upload complete")
-                        st.success(f"Uploaded {len(results)} products.")
-                        st.json(results)
-                    except ShopifyError as e:
-                        if str(e).startswith("DAILY_VARIANT_LIMIT:"):
-                            s.update(label="⛔ Daily variant creation limit hit")
-                            st.error("You’ve hit Shopify’s daily variant creation limit. Use CSV import now or resume via API tomorrow.")
-                        else:
-                            s.update(label="❌ Shopify upload failed")
-                            st.error(f"Shopify error: {e}")
-                    except Exception as e:
-                        s.update(label="❌ Unexpected error during upload")
-                        st.error(f"Unexpected error: {e}")
+            if has_validation_errors(csv_validation):
+                st.error("CSV export and Shopify upload blocked by listing safety errors.")
+            else:
+                filename = f"{sku_suffix}.csv"
+                df.to_csv(filename, index=False, encoding="utf-8-sig")
+                with open(filename, "rb") as f:
+                    st.download_button("📥 Download CSV File", f, file_name=filename)
+
+                if st.button("Send to Shopify"):
+                    with st.status("🚀 Uploading to Shopify…", expanded=True) as s:
+                        try:
+                            def emit(msg: str): s.write(msg)
+                            results = upload_products_from_df(df, progress=emit)
+                            s.update(label="✅ Upload complete")
+                            st.success(f"Uploaded {len(results)} products.")
+                            st.json(results)
+                        except ShopifyError as e:
+                            if str(e).startswith("DAILY_VARIANT_LIMIT:"):
+                                s.update(label="⛔ Daily variant creation limit hit")
+                                st.error("You’ve hit Shopify’s daily variant creation limit. Use CSV import now or resume via API tomorrow.")
+                            else:
+                                s.update(label="❌ Shopify upload failed")
+                                st.error(f"Shopify error: {e}")
+                        except Exception as e:
+                            s.update(label="❌ Unexpected error during upload")
+                            st.error(f"Unexpected error: {e}")
 
             with st.expander("📝 Preview Descriptions"):
                 key_col = "Base Type" if "Base Type" in df.columns else "Type"
@@ -748,7 +805,7 @@ with tab_auto:
             df_not_ready = pd.DataFrame(not_ready_info)
 
             # --- Option 1: Interactive table ---
-            st.data_editor(df_not_ready, disabled=True, use_container_width=True)
+            st.data_editor(df_not_ready, disabled=True, width="stretch")
 
     else:
         st.success("✅ All folders are ready!")
@@ -775,74 +832,104 @@ with tab_auto:
             if art:
                 art_url = get_shared_link(dbx, f"{folder_path}/{art}")
                 if art_url:
-                    st.image(art_url, caption=art, use_container_width=True)
+                    st.image(art_url, caption=art, width="stretch")
         except Exception:
             pass
 
     # -------- Build CSV (no upload) --------
     if st.button("🧱 Build CSV (no upload)", disabled=folder is None):
         design_start = time.perf_counter()
+        build_succeeded = False
         try:
             with st.status("Building design…", expanded=True) as s:
-                #df, meta, missing = build_design_dataframe(dbx, folder, excluded_colors=excluded_colors)
-                sku_suffix_dbg = download_metadata(dbx, f"{DESIGNS_ROOT}/{folder}").get("sku_suffix", "").strip().upper()
+                meta = download_metadata(dbx, f"{DESIGNS_ROOT}/{folder}")
+                metadata_validation = _validate_metadata_for_listing(meta, label=folder)
+
                 s.write(f"Mockup source: {mockup_source}")
                 s.write(f"Folder: {folder}")
-                s.write(f"SKU from metadata: {sku_suffix_dbg}")
+                s.write(f"SKU from metadata: {meta.get('sku_suffix', '').strip().upper()}")
 
-                df, meta, missing = build_design_dataframe(
-                    dbx,
-                    folder,
-                    excluded_colors=excluded_colors,
-                    mockup_source=mockup_source,
-                )
-
-                if missing:
-                    s.write(f"⚠️ Missing numbered images: {missing[:10]}{'…' if len(missing)>10 else ''}")
+                if has_validation_errors(metadata_validation):
+                    st.session_state.auto_df = None
+                    st.session_state.auto_csv_name = None
+                    st.session_state.auto_folder = None
+                    st.session_state.auto_meta = None
+                    st.session_state.auto_validation = metadata_validation
+                    s.update(label="❌ Listing safety checks failed")
                 else:
-                    s.write("✅ All image links fetched")
-                s.write("✅ DataFrame ready")
+                    df, meta, missing = build_design_dataframe(
+                        dbx,
+                        folder,
+                        excluded_colors=excluded_colors,
+                        mockup_source=mockup_source,
+                        metadata=meta,
+                    )
 
-                if do_google_guard:
-                    sheet = connect_to_sheet("SKU Tracker")
-                    existing = [row[0].strip().upper() for row in sheet.get_all_values()[1:]]
-                    sku_suffix = meta.get("sku_suffix","").strip().upper()
-                    if sku_suffix in existing:
-                        s.update(label=f"❌ SKU suffix already used: {sku_suffix}")
-                        st.stop()
+                    if missing:
+                        s.write(f"⚠️ Missing numbered images: {missing[:10]}{'…' if len(missing)>10 else ''}")
+                    else:
+                        s.write("✅ All image links fetched")
+                    s.write("✅ DataFrame ready")
 
-                local_name = f"{meta.get('sku_suffix','').strip().upper()}.csv"
-                df.to_csv(local_name, index=False, encoding="utf-8-sig")
-                s.write(f"📝 CSV saved: {local_name}")
+                    csv_validation = validate_shopify_dataframe(df, label=folder)
+                    listing_validation = combine_validation_results(metadata_validation, csv_validation)
 
-                st.session_state.auto_df = df
-                st.session_state.auto_csv_name = local_name
-                st.session_state.auto_folder = folder
-                st.session_state.auto_meta = meta
+                    if do_google_guard:
+                        sheet = connect_to_sheet("SKU Tracker")
+                        existing = [row[0].strip().upper() for row in sheet.get_all_values()[1:]]
+                        sku_suffix = meta.get("sku_suffix","").strip().upper()
+                        if sku_suffix in existing:
+                            listing_validation["errors"].append(f"SKU suffix already used in SKU Tracker: {sku_suffix}")
+                            s.update(label=f"❌ SKU suffix already used: {sku_suffix}")
 
-            st.success("Build complete. You can download the CSV below or upload when ready.")
-            try:
-                with open(st.session_state.auto_csv_name, "rb") as f:
-                    st.download_button("📥 Download CSV File", f, file_name=st.session_state.auto_csv_name)
-            except Exception:
-                pass
+                    st.session_state.auto_validation = listing_validation
 
-            st.dataframe(st.session_state.auto_df.head(15))
+                    if has_validation_errors(listing_validation):
+                        st.session_state.auto_df = None
+                        st.session_state.auto_csv_name = None
+                        st.session_state.auto_folder = None
+                        st.session_state.auto_meta = None
+                        s.update(label="❌ Listing safety checks failed")
+                    else:
+                        local_name = f"{meta.get('sku_suffix','').strip().upper()}.csv"
+                        df.to_csv(local_name, index=False, encoding="utf-8-sig")
+                        s.write(f"📝 CSV saved: {local_name}")
 
-            col_m, col_c = st.columns(2)
-            if col_m.button("📦 Move this design to /finished now"):
+                        st.session_state.auto_df = df
+                        st.session_state.auto_csv_name = local_name
+                        st.session_state.auto_folder = folder
+                        st.session_state.auto_meta = meta
+                        build_succeeded = True
+
+            if st.session_state.auto_validation:
+                _render_listing_safety_checks(st.session_state.auto_validation)
+
+            if has_validation_errors(st.session_state.auto_validation):
+                st.error("CSV export and Shopify upload blocked by listing safety errors.")
+            elif build_succeeded:
+                st.success("Build complete. You can download the CSV below or upload when ready.")
                 try:
-                    dest = move_selected_to_finished(dbx, folder)
-                    st.success(f"Moved to: {dest}")
-                except Exception as e:
-                    st.error(f"Move failed: {e}")
+                    with open(st.session_state.auto_csv_name, "rb") as f:
+                        st.download_button("📥 Download CSV File", f, file_name=st.session_state.auto_csv_name)
+                except Exception:
+                    pass
 
-            if col_c.button("🧹 Delete images 1–127 in /finished and archive to Completed"):
-                try:
-                    deleted, dest = clean_and_archive_to_completed(dbx, folder)
-                    st.success(f"Deleted {deleted} numbered images and archived to: {dest}")
-                except Exception as e:
-                    st.error(f"Clean & archive failed: {e}. Tip: move to /finished first.")
+                st.dataframe(st.session_state.auto_df.head(15))
+
+                col_m, col_c = st.columns(2)
+                if col_m.button("📦 Move this design to /finished now"):
+                    try:
+                        dest = move_selected_to_finished(dbx, folder)
+                        st.success(f"Moved to: {dest}")
+                    except Exception as e:
+                        st.error(f"Move failed: {e}")
+
+                if col_c.button("🧹 Delete images 1–127 in /finished and archive to Completed"):
+                    try:
+                        deleted, dest = clean_and_archive_to_completed(dbx, folder)
+                        st.success(f"Deleted {deleted} numbered images and archived to: {dest}")
+                    except Exception as e:
+                        st.error(f"Clean & archive failed: {e}. Tip: move to /finished first.")
         finally:
             st.info(f"⏱ Build finished in {fmt_secs(time.perf_counter() - design_start)}")
 
@@ -855,39 +942,49 @@ with tab_auto:
             design_start = time.perf_counter()
             df = st.session_state.auto_df
             meta = st.session_state.auto_meta
+            base_validation = st.session_state.auto_validation or validate_shopify_dataframe(df, label=folder)
+            upload_validation = combine_validation_results(base_validation)
+            pending_tracker_row = None
 
             if do_google_guard:
                 sheet = connect_to_sheet("SKU Tracker")
                 existing = [row[0].strip().upper() for row in sheet.get_all_values()[1:]]
                 sku_suffix = meta.get("sku_suffix","").strip().upper()
                 if sku_suffix in existing:
-                    st.error(f"❌ SKU suffix already used: {sku_suffix}")
-                    st.stop()
-                sheet.append_row([sku_suffix, "StreamlitAuto", datetime.now().isoformat()])
-
-            with st.status("🚀 Uploading to Shopify…", expanded=True) as s:
-                try:
-                    def emit(msg: str): s.write(msg)
-                    cap = variant_cap if variant_cap > 0 else None
-                    results = upload_products_from_df(df, progress=emit, variant_budget=cap)
-                    s.update(label="✅ Upload complete")
-                    st.success(f"Uploaded {len(results)} products.")
-                    st.json(results)
-                except ShopifyError as e:
-                    if str(e).startswith("DAILY_VARIANT_LIMIT:"):
-                        s.update(label="⛔ Daily variant creation limit hit")
-                        st.error("You’ve hit Shopify’s daily variant creation limit. Use CSV import now or resume via API tomorrow.")
-                    else:
-                        s.update(label="❌ Shopify upload failed"); st.error(f"Shopify error: {e}")
-                except Exception as e:
-                    s.update(label="❌ Unexpected error during upload"); st.error(f"Unexpected error: {e}")
+                    upload_validation["errors"].append(f"SKU suffix already used in SKU Tracker: {sku_suffix}")
                 else:
-                    if move_after_upload:
-                        try:
-                            final_path = move_to_finished(get_dropbox_client(), DESIGNS_ROOT, folder, finished_dir="finished")
-                            st.success(f"📦 Moved folder to: {final_path}")
-                        except Exception as e:
-                            st.warning(f"Uploaded, but move_to_finished failed: {e}")
+                    pending_tracker_row = [sku_suffix, "StreamlitAuto", datetime.now().isoformat()]
+
+            _render_listing_safety_checks(upload_validation)
+
+            if has_validation_errors(upload_validation):
+                st.error("Shopify upload blocked by listing safety errors.")
+            else:
+                with st.status("🚀 Uploading to Shopify…", expanded=True) as s:
+                    try:
+                        def emit(msg: str): s.write(msg)
+                        cap = variant_cap if variant_cap > 0 else None
+                        results = upload_products_from_df(df, progress=emit, variant_budget=cap)
+                        if pending_tracker_row:
+                            sheet.append_row(pending_tracker_row)
+                        s.update(label="✅ Upload complete")
+                        st.success(f"Uploaded {len(results)} products.")
+                        st.json(results)
+                    except ShopifyError as e:
+                        if str(e).startswith("DAILY_VARIANT_LIMIT:"):
+                            s.update(label="⛔ Daily variant creation limit hit")
+                            st.error("You’ve hit Shopify’s daily variant creation limit. Use CSV import now or resume via API tomorrow.")
+                        else:
+                            s.update(label="❌ Shopify upload failed"); st.error(f"Shopify error: {e}")
+                    except Exception as e:
+                        s.update(label="❌ Unexpected error during upload"); st.error(f"Unexpected error: {e}")
+                    else:
+                        if move_after_upload:
+                            try:
+                                final_path = move_to_finished(get_dropbox_client(), DESIGNS_ROOT, folder, finished_dir="finished")
+                                st.success(f"📦 Moved folder to: {final_path}")
+                            except Exception as e:
+                                st.warning(f"Uploaded, but move_to_finished failed: {e}")
             st.info(f"⏱ Upload finished in {fmt_secs(time.perf_counter() - design_start)}")
 
     # ---------- Batch CSV (no upload) ----------
@@ -898,52 +995,79 @@ with tab_auto:
         batch_start = time.perf_counter()
         try:
             st.session_state.batch_targets = []
+            st.session_state.pop("batch_csv_files", None)
             targets = [folder] if only_selected else list(ready_folders)
             dfs = []
             built_targets = []
             failed_builds = []
+            batch_validation_parts = []
             for fname in targets:
                 try:
+                    meta_i = download_metadata(dbx, f"{DESIGNS_ROOT}/{fname}")
+                    metadata_validation = _validate_metadata_for_listing(meta_i, label=fname)
+                    batch_validation_parts.append(metadata_validation)
+
+                    if has_validation_errors(metadata_validation):
+                        failed_builds.append((fname, _format_validation_errors(metadata_validation)))
+                        continue
+
                     df_i, _, _ = build_design_dataframe(
                         dbx,
                         fname,
                         excluded_colors=excluded_colors,
                         mockup_source=mockup_source,
+                        metadata=meta_i,
                     )
+                    batch_validation_parts.append(validate_shopify_dataframe(df_i, label=fname))
                     dfs.append(df_i)
                     built_targets.append(fname)
                 except Exception as e:
                     failed_builds.append((fname, str(e)))
 
-            if not dfs:
+            batch_validation = combine_validation_results(*batch_validation_parts)
+            all_df = None
+            if not has_validation_errors(batch_validation) and dfs:
+                all_df = pd.concat(dfs, ignore_index=True)
+                batch_validation = combine_validation_results(
+                    batch_validation,
+                    validate_shopify_dataframe(all_df, label="Batch combined"),
+                )
+
+            _render_listing_safety_checks(batch_validation)
+
+            if has_validation_errors(batch_validation):
+                st.session_state.pop("batch_csv_files", None)
+                st.error("Batch CSV export blocked by listing safety errors.")
+                for fname, reason in failed_builds:
+                    st.error(f"{fname}: {reason}")
+            elif not dfs:
                 st.warning("No dataframes built.")
                 for fname, reason in failed_builds:
                     st.error(f"{fname}: {reason}")
-                st.stop()
+                st.session_state.pop("batch_csv_files", None)
+            else:
+                chunks = _split_df_by_limits(all_df)
 
-            all_df = pd.concat(dfs, ignore_index=True)
-            chunks = _split_df_by_limits(all_df)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                built = []
+                files = []
+                for i, cdf in enumerate(chunks, start=1):
+                    csv_bytes = cdf.to_csv(index=False).encode("utf-8-sig")
+                    size_kb = len(csv_bytes) / 1024.0
+                    fname = f"BATCH_{ts}_part{i}.csv"
+                    files.append((fname, csv_bytes))
+                    built.append((fname, len(cdf), size_kb))
 
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            built = []
-            files = []
-            for i, cdf in enumerate(chunks, start=1):
-                csv_bytes = cdf.to_csv(index=False).encode("utf-8-sig")
-                size_kb = len(csv_bytes) / 1024.0
-                fname = f"BATCH_{ts}_part{i}.csv"
-                files.append((fname, csv_bytes))
-                built.append((fname, len(cdf), size_kb))
+                # Store in session so buttons persist
+                _stash_downloads("batch_csv_files", files)
 
-            # Store in session so buttons persist
-            _stash_downloads("batch_csv_files", files)
+                _render_downloads("batch_csv_files", "Your batch CSV file(s)", zip_name_prefix="BATCH")
 
-            _render_downloads("batch_csv_files", "Your batch CSV file(s)", zip_name_prefix="BATCH")
-
-            total_rows = sum(r for _, r, _ in built)
-            st.success(f"Built {len(built)} CSV file(s) under {CSV_MAX_MB} MB each, total {total_rows} rows.")
-            st.session_state.batch_targets = built_targets
-            for fname, reason in failed_builds:
-                st.warning(f"{fname}: {reason}")
+                total_rows = sum(r for _, r, _ in built)
+                st.success(f"Built {len(built)} CSV file(s) under {CSV_MAX_MB} MB each, total {total_rows} rows.")
+                st.session_state.batch_targets = built_targets
+                for fname, reason in failed_builds:
+                    st.warning(f"{fname}: {reason}")
 
         finally:
             st.info(f"⏱ Batch CSV build finished in {fmt_secs(time.perf_counter() - batch_start)}")
@@ -985,27 +1109,47 @@ with tab_auto:
             with st.status(f"📦 {fname}: starting…", expanded=True) as s:
                 t0 = time.perf_counter()
                 try:
-                    #df, meta, missing = build_design_dataframe(dbx, folder, excluded_colors=excluded_colors)
+                    meta = download_metadata(dbx, f"{DESIGNS_ROOT}/{fname}")
+                    metadata_validation = _validate_metadata_for_listing(meta, label=fname)
+                    if has_validation_errors(metadata_validation):
+                        _render_listing_safety_checks(metadata_validation)
+                        s.update(label=f"❌ {fname}: listing safety checks failed")
+                        summary.append((fname, False, _format_validation_errors(metadata_validation), time.perf_counter()-t0))
+                        continue
+
                     df, meta, missing = build_design_dataframe(
                         dbx,
                         fname,
                         excluded_colors=excluded_colors,
                         mockup_source=mockup_source,
+                        metadata=meta,
                     )   
 
                     if missing: s.write(f"⚠️ Missing images: {missing[:10]}{'…' if len(missing)>10 else ''}")
                     else: s.write("✅ All image links fetched")
                     s.write("✅ DataFrame ready")
 
+                    listing_validation = combine_validation_results(
+                        metadata_validation,
+                        validate_shopify_dataframe(df, label=fname),
+                    )
+                    pending_tracker_row = None
+
                     if do_google_guard:
                         sheet = connect_to_sheet("SKU Tracker")
                         existing = [row[0].strip().upper() for row in sheet.get_all_values()[1:]]
                         sku_suffix = meta.get("sku_suffix","").strip().upper()
                         if sku_suffix in existing:
-                            s.update(label=f"❌ {fname}: SKU already used")
-                            summary.append((fname, False, "SKU used", time.perf_counter()-t0))
-                            continue
-                        sheet.append_row([sku_suffix, "StreamlitBatch", datetime.now().isoformat()])
+                            listing_validation["errors"].append(f"SKU suffix already used in SKU Tracker: {sku_suffix}")
+                        else:
+                            pending_tracker_row = [sku_suffix, "StreamlitBatch", datetime.now().isoformat()]
+
+                    _render_listing_safety_checks(listing_validation)
+
+                    if has_validation_errors(listing_validation):
+                        s.update(label=f"❌ {fname}: listing safety checks failed")
+                        summary.append((fname, False, _format_validation_errors(listing_validation), time.perf_counter()-t0))
+                        continue
 
                     local_name = f"{meta.get('sku_suffix','').strip().upper()}.csv"
                     df.to_csv(local_name, index=False, encoding="utf-8-sig")
@@ -1013,6 +1157,8 @@ with tab_auto:
 
                     def emit(msg: str): s.write(msg)
                     results = upload_products_from_df(df, progress=emit)
+                    if pending_tracker_row:
+                        sheet.append_row(pending_tracker_row)
                     s.update(label=f"✅ {fname}: upload complete")
                     summary.append((fname, True, "", time.perf_counter()-t0))
 
