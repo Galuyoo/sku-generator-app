@@ -260,6 +260,23 @@ def _render_listing_safety_checks(validation: dict, *, expanded: bool = False) -
                 st.write(f"- {item}")
 
 
+def render_section_header(title: str, caption: str | None = None):
+    st.markdown(f"### {title}")
+    if caption:
+        st.caption(caption)
+
+
+def render_action_summary(folder=None, sku_suffix=None, mockup_source=None, store=None):
+    with st.container(border=True):
+        st.markdown("#### Current selection")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Folder", folder or "None")
+        col2.metric("SKU", sku_suffix or "N/A")
+        col3.metric("Mockups", mockup_source or "N/A")
+        if store:
+            st.caption(f"Target store: {store}")
+
+
 # ---------- Streamlit config ----------
 st.set_page_config(page_title="SKU Generator", layout="centered")
 
@@ -423,6 +440,8 @@ def ensure_shopify_csv_fields(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# Future migration note:
+# Keep workflow logic in functions outside Streamlit UI so Django can reuse it later.
 def build_design_dataframe(
     dbx: dropbox.Dropbox,
     folder: str,
@@ -748,8 +767,24 @@ def clean_and_archive_to_completed(dbx: dropbox.Dropbox, folder: str) -> tuple[i
 # Tab 2: Auto from Dropbox
 # =========================
 with tab_auto:
-    mockup_source = st.selectbox("Mockup source", ["Dropbox", "Canva"], index=0)
-    st.subheader("Auto-generate from design folders")
+    render_section_header(
+        "Auto from Dropbox",
+        "Build Shopify CSVs from ready design folders, then download or upload after safety checks pass.",
+    )
+
+    with st.container(border=True):
+        render_section_header("Source settings")
+        mockup_source = st.selectbox("Mockup source", ["Dropbox", "Canva"], index=0)
+
+        col1, col2, col3 = st.columns(3)
+        do_google_guard     = col1.checkbox("Google SKU guard", value=True)
+        show_preview        = col2.checkbox("Show design preview", value=True)
+        show_descs          = col3.checkbox("Show description preview", value=False)
+
+        col4, col5 = st.columns(2)
+        move_after_upload   = col4.checkbox("Move to /finished after upload", value=False)
+        variant_cap         = col5.number_input("Max variants to create this run (0 = no cap)",
+                                                min_value=0, value=0, step=50)
 
     if not DESIGNS_ROOT:
         st.warning("Set `FOLDER_PATH_Design` in dpbox.env to your `/designs` root to use this tab.")
@@ -757,87 +792,88 @@ with tab_auto:
 
     dbx = get_dropbox_client()
 
-    if st.session_state.get("last_mockup_source") != mockup_source:
+    cached_ready_folders = st.session_state.get("ready_folders", [])
+    cached_not_ready_folders = st.session_state.get("not_ready_folders", [])
+
+    if (
+        st.session_state.get("last_mockup_source") != mockup_source
+        or (not cached_ready_folders and not cached_not_ready_folders)
+    ):
         st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
             dbx, DESIGNS_ROOT, mockup_source=mockup_source
         )
         st.session_state.last_mockup_source = mockup_source
 
-    colA, colB = st.columns([1,1])
-    with colA:
-        if st.button("🔄 Refresh ready folders"):
-            ready, not_ready = analyze_design_folders(dbx, DESIGNS_ROOT, mockup_source=mockup_source)
-            st.session_state.ready_folders = ready
-            st.session_state.not_ready_folders = not_ready
+    ready_folders = st.session_state.get("ready_folders", [])
+    not_ready_info = st.session_state.get("not_ready_folders", [])
 
-    with colB:
-        if not st.session_state.ready_folders:
-            ready, not_ready = analyze_design_folders(dbx, DESIGNS_ROOT, mockup_source=mockup_source)
-            st.session_state.ready_folders = ready
-            st.session_state.not_ready_folders = not_ready
-
-    if "ready_folders" not in st.session_state or "not_ready_folders" not in st.session_state:
-        st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
-            dbx, DESIGNS_ROOT, mockup_source=mockup_source
-            )
-
-    colA, colB = st.columns([1, 1])
-    with colA:
-        if st.button("🔄 Refresh folder analysis"):
+    with st.container(border=True):
+        render_section_header("Folder readiness")
+        if st.button("Refresh folder analysis"):
             st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
                 dbx, DESIGNS_ROOT, mockup_source=mockup_source
             )
+            ready_folders = st.session_state.get("ready_folders", [])
+            not_ready_info = st.session_state.get("not_ready_folders", [])
 
-    ready_folders = st.session_state.ready_folders
-    not_ready_info = st.session_state.not_ready_folders
+        col_ready, col_not_ready = st.columns(2)
+        col_ready.metric("Ready folders", len(ready_folders))
+        col_not_ready.metric("Not ready", len(not_ready_info))
 
-    if ready_folders:
-        folder = st.selectbox("Choose a ready folder", ready_folders, index=0)
-    else:
-        folder = None
-        st.info("No ready folders for the selected mockup source.")    
+        if not_ready_info:
+            with st.expander("Not ready folders"):
+                df_not_ready = pd.DataFrame(not_ready_info)
+                st.data_editor(df_not_ready, disabled=True, width="stretch")
+        else:
+            st.success("All folders are ready.")
 
-    folder_path = f"{DESIGNS_ROOT}/{folder}" if folder else None
+    with st.container(border=True):
+        render_section_header("Selected design")
 
-    if not_ready_info:
-        with st.expander("📂 Not Ready Folders"):
-            st.markdown(f"❌ **{len(not_ready_info)} folders not ready**")
-            df_not_ready = pd.DataFrame(not_ready_info)
+        if ready_folders:
+            folder = st.selectbox("Choose a ready folder", ready_folders, index=0)
+        else:
+            folder = None
+            st.info("No ready folders for the selected mockup source.")
 
-            # --- Option 1: Interactive table ---
-            st.data_editor(df_not_ready, disabled=True, width="stretch")
+        folder_path = f"{DESIGNS_ROOT}/{folder}" if folder else None
+        selected_sku_suffix = None
+        if folder_path:
+            try:
+                selected_sku_suffix = download_metadata(dbx, folder_path).get("sku_suffix", "").strip().upper()
+            except Exception as e:
+                st.warning(f"Could not read selected metadata: {e}")
 
-    else:
-        st.success("✅ All folders are ready!")
+        render_action_summary(
+            folder=folder,
+            sku_suffix=selected_sku_suffix,
+            mockup_source=mockup_source,
+            store=st.session_state.get("shop_profile_label"),
+        )
 
-    col1, col2, col3 = st.columns(3)
-    do_google_guard     = col1.checkbox("Google SKU guard", value=True)
-    show_preview        = col2.checkbox("Show design preview", value=True)
-    show_descs          = col3.checkbox("Show description preview", value=False)
+        if show_preview and folder_path:
+            try:
+                entries = dbx.files_list_folder(folder_path).entries
+                art = next(
+                    (e.name for e in entries
+                     if isinstance(e, dropbox.files.FileMetadata)
+                     and e.name.split(".")[0]==folder
+                     and e.name.lower().split(".")[-1] in {"png","jpg","jpeg","webp"}), None
+                )
+                if art:
+                    art_url = get_shared_link(dbx, f"{folder_path}/{art}")
+                    if art_url:
+                        st.image(art_url, caption=art, width="stretch")
+            except Exception:
+                pass
 
-    col4, col5 = st.columns(2)
-    move_after_upload   = col4.checkbox("Move to /finished after upload", value=False)
-    variant_cap         = col5.number_input("Max variants to create this run (0 = no cap)",
-                                            min_value=0, value=0, step=50)
+    with st.container(border=True):
+        render_section_header("Build CSV")
 
-    if show_preview and folder_path:
-        try:
-            entries = dbx.files_list_folder(folder_path).entries
-            art = next(
-                (e.name for e in entries
-                 if isinstance(e, dropbox.files.FileMetadata)
-                 and e.name.split(".")[0]==folder
-                 and e.name.lower().split(".")[-1] in {"png","jpg","jpeg","webp"}), None
-            )
-            if art:
-                art_url = get_shared_link(dbx, f"{folder_path}/{art}")
-                if art_url:
-                    st.image(art_url, caption=art, width="stretch")
-        except Exception:
-            pass
+        # -------- Build CSV (no upload) --------
+        build_selected_clicked = st.button("Build selected CSV", disabled=folder is None)
 
-    # -------- Build CSV (no upload) --------
-    if st.button("🧱 Build CSV (no upload)", disabled=folder is None):
+    if build_selected_clicked:
         design_start = time.perf_counter()
         build_succeeded = False
         try:
@@ -907,35 +943,41 @@ with tab_auto:
             if has_validation_errors(st.session_state.auto_validation):
                 st.error("CSV export and Shopify upload blocked by listing safety errors.")
             elif build_succeeded:
+                render_section_header("Download / upload actions")
                 st.success("Build complete. You can download the CSV below or upload when ready.")
                 try:
                     with open(st.session_state.auto_csv_name, "rb") as f:
-                        st.download_button("📥 Download CSV File", f, file_name=st.session_state.auto_csv_name)
+                        st.download_button("Download selected CSV", f, file_name=st.session_state.auto_csv_name)
                 except Exception:
                     pass
 
                 st.dataframe(st.session_state.auto_df.head(15))
 
-                col_m, col_c = st.columns(2)
-                if col_m.button("📦 Move this design to /finished now"):
-                    try:
-                        dest = move_selected_to_finished(dbx, folder)
-                        st.success(f"Moved to: {dest}")
-                    except Exception as e:
-                        st.error(f"Move failed: {e}")
+                with st.expander("Advanced folder actions"):
+                    col_m, col_c = st.columns(2)
+                    if col_m.button("Move this design to /finished now"):
+                        try:
+                            dest = move_selected_to_finished(dbx, folder)
+                            st.success(f"Moved to: {dest}")
+                        except Exception as e:
+                            st.error(f"Move failed: {e}")
 
-                if col_c.button("🧹 Delete images 1–127 in /finished and archive to Completed"):
-                    try:
-                        deleted, dest = clean_and_archive_to_completed(dbx, folder)
-                        st.success(f"Deleted {deleted} numbered images and archived to: {dest}")
-                    except Exception as e:
-                        st.error(f"Clean & archive failed: {e}. Tip: move to /finished first.")
+                    if col_c.button("Delete images 1-127 and archive to Completed"):
+                        try:
+                            deleted, dest = clean_and_archive_to_completed(dbx, folder)
+                            st.success(f"Deleted {deleted} numbered images and archived to: {dest}")
+                        except Exception as e:
+                            st.error(f"Clean & archive failed: {e}. Tip: move to /finished first.")
         finally:
             st.info(f"⏱ Build finished in {fmt_secs(time.perf_counter() - design_start)}")
 
     # -------- Upload built CSV (separate step) --------
     upload_disabled = st.session_state.auto_df is None or st.session_state.auto_folder != folder
-    if st.button("🚀 Upload built CSV to Shopify", disabled=upload_disabled):
+    with st.container(border=True):
+        render_section_header("Upload")
+        upload_selected_clicked = st.button("Upload selected CSV to Shopify", disabled=upload_disabled)
+
+    if upload_selected_clicked:
         if upload_disabled:
             st.warning("Build the CSV first for this folder.")
         else:
@@ -988,10 +1030,16 @@ with tab_auto:
             st.info(f"⏱ Upload finished in {fmt_secs(time.perf_counter() - design_start)}")
 
     # ---------- Batch CSV (no upload) ----------
-    st.markdown("### 🧾 Batch CSV (no upload)")
-    only_selected = st.checkbox("Only include selected folder", value=False)
+    with st.container(border=True):
+        render_section_header("Batch CSV files")
+        only_selected = st.checkbox("Only include selected folder", value=False)
+        build_batch_clicked = st.button("Build batch CSV files")
 
-    if st.button("📦 Build CSV(s) for batch (no upload)"):
+    with st.expander("Bulk Shopify upload"):
+        st.warning("This uploads all ready folders to Shopify. Use only after reviewing readiness and safety checks.")
+        upload_all_clicked = st.button("Upload all ready folders to Shopify")
+
+    if build_batch_clicked:
         batch_start = time.perf_counter()
         try:
             st.session_state.batch_targets = []
@@ -1073,35 +1121,36 @@ with tab_auto:
             st.info(f"⏱ Batch CSV build finished in {fmt_secs(time.perf_counter() - batch_start)}")
 
     # -------- Batch post-build actions --------
-    c1, c2 = st.columns(2)
-    if c1.button("📦 Move batch to /finished"):
-        targets = st.session_state.get("batch_targets") or ([folder] if only_selected else list(ready_folders))
-        with st.status("Moving folders to /finished…", expanded=True) as s:
-            ok = 0
-            for fname in targets:
-                try:
-                    dest = move_selected_to_finished(dbx, fname)
-                    s.write(f"• {fname}: ✅ moved → {dest}")
-                    ok += 1
-                except Exception as e:
-                    s.write(f"• {fname}: ❌ {e}")
-            s.update(label=f"Done. {ok}/{len(targets)} moved.")
+    with st.expander("Advanced folder actions"):
+        c1, c2 = st.columns(2)
+        if c1.button("Move batch to /finished"):
+            targets = st.session_state.get("batch_targets") or ([folder] if only_selected else list(ready_folders))
+            with st.status("Moving folders to /finished…", expanded=True) as s:
+                ok = 0
+                for fname in targets:
+                    try:
+                        dest = move_selected_to_finished(dbx, fname)
+                        s.write(f"• {fname}: ✅ moved → {dest}")
+                        ok += 1
+                    except Exception as e:
+                        s.write(f"• {fname}: ❌ {e}")
+                s.update(label=f"Done. {ok}/{len(targets)} moved.")
 
-    if c2.button("🧹 Clean 1–127 imgs & archive batch to Completed"):
-        targets = st.session_state.get("batch_targets") or ([folder] if only_selected else list(ready_folders))
-        with st.status("Cleaning numbered images and archiving to Completed…", expanded=True) as s:
-            ok = 0
-            for fname in targets:
-                try:
-                    deleted, dest = clean_and_archive_to_completed(dbx, fname)
-                    s.write(f"• {fname}: ✅ deleted {deleted} and archived → {dest}")
-                    ok += 1
-                except Exception as e:
-                    s.write(f"• {fname}: ❌ {e}")
-            s.update(label=f"Done. {ok}/{len(targets)} archived.")
+        if c2.button("Clean 1-127 imgs and archive batch to Completed"):
+            targets = st.session_state.get("batch_targets") or ([folder] if only_selected else list(ready_folders))
+            with st.status("Cleaning numbered images and archiving to Completed…", expanded=True) as s:
+                ok = 0
+                for fname in targets:
+                    try:
+                        deleted, dest = clean_and_archive_to_completed(dbx, fname)
+                        s.write(f"• {fname}: ✅ deleted {deleted} and archived → {dest}")
+                        ok += 1
+                    except Exception as e:
+                        s.write(f"• {fname}: ❌ {e}")
+                s.update(label=f"Done. {ok}/{len(targets)} archived.")
 
     # -------- Original batch uploader (unchanged) --------
-    if st.button("⚙️ Build & Upload ALL ready folders"):
+    if upload_all_clicked:
         batch_start = time.perf_counter()
         summary = []
         for fname in ready_folders:
