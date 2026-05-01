@@ -12,6 +12,34 @@ load_dotenv("dpbox.env")
 ## Trying to speed up image link fetching with threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+NUMBERED_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _list_numbered_image_paths(
+    dbx: dropbox.Dropbox,
+    folder_path: str,
+    total_images: int,
+) -> dict[int, str]:
+    """
+    Build a map like {1: "/root/1.jpg", 2: "/root/2.png"} for supported
+    numbered mockup images in a folder.
+    """
+    image_paths = {}
+    entries = dbx.files_list_folder(folder_path).entries
+    for entry in entries:
+        if not isinstance(entry, dropbox.files.FileMetadata):
+            continue
+
+        lower_name = entry.name.lower()
+        stem, ext = os.path.splitext(lower_name)
+        if not stem.isdigit() or ext not in NUMBERED_IMAGE_EXTENSIONS:
+            continue
+
+        index = int(stem)
+        if 1 <= index <= total_images and index not in image_paths:
+            image_paths[index] = f"{folder_path}/{entry.name}"
+    return image_paths
+
 def load_dropbox_image_links_parallel(
     dbx: dropbox.Dropbox,
     folder_path: str,
@@ -23,9 +51,12 @@ def load_dropbox_image_links_parallel(
     """Parallel version of load_dropbox_image_links using ThreadPoolExecutor."""
     image_links = {}
     failed = []
+    image_paths = _list_numbered_image_paths(dbx, folder_path, total_images)
 
     def try_get_link(i):
-        path = f"{folder_path}/{i}.png"
+        path = image_paths.get(i)
+        if not path:
+            return i, None
         attempt = 0
         while attempt < max_attempts:
             url = get_shared_link(dbx, path)
@@ -86,11 +117,17 @@ def load_dropbox_image_links(
     """Load direct links for a numbered set of images in a Dropbox folder."""
     image_links = {}
     failed = []
+    image_paths = _list_numbered_image_paths(dbx, folder_path, total_images)
     for i in range(1, total_images + 1):
+        path = image_paths.get(i)
+        if not path:
+            failed.append(i)
+            continue
+
         attempt = 0
         success = False
         while attempt < max_attempts:
-            url = get_shared_link(dbx, f"{folder_path}/{i}.png")
+            url = get_shared_link(dbx, path)
             if url:
                 image_links[i] = url
                 success = True

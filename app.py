@@ -9,9 +9,9 @@ from dotenv import load_dotenv
 import time
 import requests
 import re
-
 # --- your existing imports (unchanged) ---
 from utils import shopify_utils
+from utils.canva_utils import load_canva_image_links_by_sku
 from constants.config import shopify_defaults
 from constants.data_loader import load_json
 from utils.sku_generator import generate_sku_dataframe
@@ -26,6 +26,142 @@ from utils.shopify_utils import upload_products_from_df, ShopifyError
 from utils.dropbox_utils import load_dropbox_image_links_parallel as load_dropbox_image_links
 
 import io, zipfile
+
+def analyze_design_folders(
+    dbx: dropbox.Dropbox,
+    root: str,
+    mockup_source: str = "Dropbox",
+):
+    ready, not_ready = [], []
+
+    try:
+        res = dbx.files_list_folder(root)
+        IGNORE_FOLDERS = {"finished", "images", "designs", "1_ready"}
+
+        folders = [
+            e.name for e in res.entries
+            if isinstance(e, dropbox.files.FolderMetadata) and e.name.lower() not in IGNORE_FOLDERS
+        ]
+    except Exception as e:
+        return ready, [{"Folder": "N/A", "Issues": f"Failed to list root: {e}"}]
+
+    for name in folders:
+        path = f"{root}/{name}"
+        try:
+            entries = dbx.files_list_folder(path).entries
+            files = {e.name for e in entries if isinstance(e, dropbox.files.FileMetadata)}
+
+            errors = []
+
+            json_files = [fn for fn in files if fn.lower().endswith(".json")]
+            has_meta = bool(json_files)
+            has_txt = any(fn.lower().endswith((".txt", ".pdf")) for fn in files)
+            has_art = any(
+                fn.split(".")[0] == name and fn.lower().split(".")[-1] in {"png", "jpg", "jpeg", "webp"}
+                for fn in files
+            )
+
+            sku_suffix = ""
+            descriptions_count_label = "N/A"
+            if has_meta:
+                try:
+                    meta = download_metadata(dbx, path)
+                    sku_suffix = (meta.get("sku_suffix") or "").strip().upper()
+                    meta_issues, descriptions_count_label = _metadata_issues(meta)
+                    errors.extend(meta_issues)
+                except Exception as e:
+                    errors.append(f"Invalid metadata.json: {e}")
+
+            if not has_meta:
+                errors.append("Missing metadata .json")
+
+            if not has_art:
+                errors.append("Missing matching artwork")
+
+            image_count_label = "N/A"
+
+            if mockup_source == "Canva":
+                if not sku_suffix:
+                    errors.append("Missing sku_suffix in metadata.json")
+            else:
+                numbered_images = [
+                    fn for fn in files
+                    if fn.lower().endswith((".png", ".jpg", ".jpeg", ".webp")) and fn.split(".")[0].isdigit()
+                ]
+                numbered_count = len(numbered_images)
+                image_count_label = f"{numbered_count} / 80"
+
+                if numbered_count < 80:
+                    errors.append(f"Only {numbered_count}/80 images")
+
+            if errors:
+                not_ready.append({
+                    "Folder": name,
+                    "Has .json": "✅" if has_meta else "❌",
+                    "Has notes": "✅" if has_txt else "❌",
+                    "Has art": "✅" if has_art else "❌",
+                    "Image count": image_count_label,
+                    "Descriptions": descriptions_count_label,
+                    "SKU in json": "✅" if sku_suffix else "❌",
+                    "Issues": ", ".join(errors),
+                })
+            else:
+                ready.append(name)
+
+        except Exception as e:
+            not_ready.append({
+                "Folder": name,
+                "Has .json": "❌",
+                "Has notes": "❌",
+                "Has art": "❌",
+                "Image count": "N/A" if mockup_source == "Canva" else "0 / 80",
+                "Descriptions": "N/A",
+                "SKU in json": "❌",
+                "Issues": f"Error: {e}",
+            })
+
+    return ready, not_ready
+
+def download_metadata(dbx: dropbox.Dropbox, folder_path: str) -> dict:
+    try:
+        entries = dbx.files_list_folder(folder_path).entries
+        json_files = [e.name for e in entries if isinstance(e, dropbox.files.FileMetadata) and e.name.lower().endswith(".json")]
+        if not json_files:
+            raise FileNotFoundError(f"No .json metadata file found in {folder_path}")
+        target_file = json_files[0]  # Use first one found
+        _, res = dbx.files_download(f"{folder_path}/{target_file}")
+        return json.loads(res.content)
+    except dropbox.exceptions.ApiError as e:
+        raise RuntimeError(f"Error accessing {folder_path}: {e}")
+
+
+def _metadata_issues(meta: dict) -> tuple[list[str], str]:
+    issues = []
+
+    product_name = (meta.get("product_name") or "").strip()
+    sku_suffix = (meta.get("sku_suffix") or "").strip().upper()
+    main_color = (meta.get("main_color") or "").strip()
+    descriptions = meta.get("descriptions", [])
+
+    if not product_name:
+        issues.append("Missing product_name in metadata.json")
+    if not sku_suffix:
+        issues.append("Missing sku_suffix in metadata.json")
+    if not main_color:
+        issues.append("Missing main_color in metadata.json")
+
+    if not isinstance(descriptions, list):
+        issues.append("metadata.json 'descriptions' must be a list")
+        descriptions_count_label = "invalid"
+    else:
+        descriptions_count = len([d for d in descriptions if str(d).strip()])
+        descriptions_count_label = f"{descriptions_count} / {len(garment_keys)}"
+        if descriptions_count != len(garment_keys):
+            issues.append(
+                f"Descriptions incomplete: found {descriptions_count}/{len(garment_keys)} required entries"
+            )
+
+    return issues, descriptions_count_label
 
 def _stash_downloads(key: str, files: list[tuple[str, bytes]]):
     """
@@ -173,91 +309,14 @@ if "dropbox_image_links" not in st.session_state: st.session_state.dropbox_image
 if "dropbox_links_loaded" not in st.session_state: st.session_state.dropbox_links_loaded = False
 if "loaded_folder_path" not in st.session_state: st.session_state.loaded_folder_path = None
 if "ready_folders" not in st.session_state: st.session_state.ready_folders = []
+if "not_ready_folders" not in st.session_state: st.session_state.not_ready_folders = []
+if "last_mockup_source" not in st.session_state: st.session_state.last_mockup_source = None
 if "auto_df" not in st.session_state: st.session_state.auto_df = None
 if "auto_csv_name" not in st.session_state: st.session_state.auto_csv_name = None
 if "auto_folder" not in st.session_state: st.session_state.auto_folder = None
 if "auto_meta" not in st.session_state: st.session_state.auto_meta = None
 
 # ---------- Small helpers ----------
-def analyze_design_folders(dbx: dropbox.Dropbox, root: str):
-    """Return (ready_list, not_ready_list), with deeper .json validation (e.g. description count)."""
-    from constants.data_loader import load_json
-
-    garment_keys = load_json("garment_keys.json")
-    ready, not_ready = [], []
-
-    try:
-        res = dbx.files_list_folder(root)
-        IGNORE_FOLDERS = {"finished", "images", "designs", "1_Ready"}
-
-        folders = [
-            e.name for e in res.entries
-            if isinstance(e, dropbox.files.FolderMetadata) and e.name.lower() not in IGNORE_FOLDERS
-        ]
-    except Exception as e:
-        return ready, [{"Folder": "N/A", "Issues": f"Failed to list root: {e}"}]
-
-    for name in folders:
-        path = f"{root}/{name}"
-        try:
-            entries = dbx.files_list_folder(path).entries
-            files = {e.name for e in entries if isinstance(e, dropbox.files.FileMetadata)}
-            errors = []
-
-            json_files = [fn for fn in files if fn.lower().endswith(".json")]
-            has_meta = bool(json_files)
-            has_txt = any(fn.lower().endswith((".txt", ".pdf")) for fn in files)
-
-            has_art = any(
-                fn.split(".")[0] == name and fn.lower().split(".")[-1] in {"png", "jpg", "jpeg", "webp"}
-                for fn in files
-            )
-            numbered_pngs = [fn for fn in files if fn.lower().endswith(".png") and fn.split(".")[0].isdigit()]
-            numbered_count = len(numbered_pngs)
-
-
-            if not has_art:
-                errors.append("Missing matching artwork")
-            if numbered_count < 80:
-                errors.append(f"Only {numbered_count}/80 images")
-
-            if errors:
-                not_ready.append({
-                    "Folder": name,
-                    "Has .json": "✅" if has_meta else "❌",
-                    "Has notes": "✅" if has_txt else "❌",
-                    "Has art": "✅" if has_art else "❌",
-                    "Image count": f"{numbered_count} / 80",
-                    "Issues": ", ".join(errors),
-                })
-            else:
-                ready.append(name)
-
-        except Exception as e:
-            not_ready.append({
-                "Folder": name,
-                "Has metadata": "❌",
-                "Has .txt": "❌",
-                "Has art": "❌",
-                "Image count": "0 / 80",
-                "Issues": f"Error: {e}",
-            })
-
-    return ready, not_ready
-
-def download_metadata(dbx: dropbox.Dropbox, folder_path: str) -> dict:
-    try:
-        entries = dbx.files_list_folder(folder_path).entries
-        json_files = [e.name for e in entries if isinstance(e, dropbox.files.FileMetadata) and e.name.lower().endswith(".json")]
-        if not json_files:
-            raise FileNotFoundError(f"No .json metadata file found in {folder_path}")
-        target_file = json_files[0]  # Use first one found
-        _, res = dbx.files_download(f"{folder_path}/{target_file}")
-        return json.loads(res.content)
-    except dropbox.exceptions.ApiError as e:
-        raise RuntimeError(f"Error accessing {folder_path}: {e}")
-
-
 def ensure_image_src_column(df: pd.DataFrame) -> pd.DataFrame:
     if "Image Src" not in df.columns and "Image URL" in df.columns:
         df["Image Src"] = df["Image URL"]
@@ -314,21 +373,24 @@ def ensure_shopify_csv_fields(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_design_dataframe(dbx: dropbox.Dropbox, folder: str, excluded_colors: list[str] = None):
-    folder_path = f"{DESIGNS_ROOT}/{folder}"
+def build_design_dataframe(
+    dbx: dropbox.Dropbox,
+    folder: str,
+    excluded_colors: list[str] = None,
+    mockup_source: str = "Dropbox",
+):
+    folder_path = f"{DESIGNS_ROOT}/{folder}" if folder else None
     meta = download_metadata(dbx, folder_path)
 
-
-    # --- NEW: extract Restrictions field ---
     restrictions = meta.get("Restrictions", "")
     if restrictions:
         excluded_colors = [c.strip() for c in restrictions.split(",") if c.strip()]
     else:
-        excluded_colors = []  # Treat missing or empty as "no restriction"
+        excluded_colors = []
 
-    product_name = meta.get("product_name","").strip()
-    sku_suffix   = meta.get("sku_suffix","").strip().upper()
-    main_color   = meta.get("main_color","").strip()
+    product_name = meta.get("product_name", "").strip()
+    sku_suffix   = meta.get("sku_suffix", "").strip().upper()
+    main_color   = meta.get("main_color", "").strip()
     tags_list    = meta.get("tags", [])
     descriptions = meta.get("descriptions", [])
     page_titles  = meta.get("page_titles", [])
@@ -337,10 +399,20 @@ def build_design_dataframe(dbx: dropbox.Dropbox, folder: str, excluded_colors: l
         raise ValueError("metadata.json missing product_name / sku_suffix / main_color")
     if not isinstance(tags_list, list):
         raise ValueError("metadata.json 'tags' must be a list")
-    if len(descriptions) != len(garment_keys):
-        raise ValueError(f"metadata.json 'descriptions' must have {len(garment_keys)} items")
+    if not isinstance(descriptions, list):
+        raise ValueError(f"{folder}: metadata.json 'descriptions' must be a list")
+    desc_count = len([d for d in descriptions if str(d).strip()])
+    if desc_count != len(garment_keys):
+        raise ValueError(
+            f"{folder}: metadata.json 'descriptions' has {desc_count}/{len(garment_keys)} items"
+        )
 
-    image_links, missing = load_dropbox_image_links(dbx, folder_path, total_images=80)
+    if mockup_source == "Canva":
+        if not sku_suffix:
+            raise ValueError("metadata.json missing sku_suffix required for Canva lookup")
+        image_links, missing = load_canva_image_links_by_sku(sku_suffix, total_images=80)
+    else:
+        image_links, missing = load_dropbox_image_links(dbx, folder_path, total_images=80)
 
     tags_csv = ", ".join(t.strip() for t in tags_list if t.strip())
     df = generate_sku_dataframe(
@@ -363,11 +435,9 @@ def build_design_dataframe(dbx: dropbox.Dropbox, folder: str, excluded_colors: l
         inventory_tracker=inventory_tracker,
         image_links=image_links,
         excluded_colors=excluded_colors,
-        page_titles=page_titles
+        page_titles=page_titles,
     )
     df = ensure_image_src_column(df)
-
-    # >>> Your requested CSV fields <<<
     df = ensure_shopify_csv_fields(df)
 
     return df, meta, missing
@@ -383,7 +453,8 @@ if not st.session_state.generating:
         st.header("🖼️ Dropbox Image Loader (Manual tab)")
         if st.button("🔄 Get / Refresh Image Links"):
             try:
-                dbx = get_dropbox_client()
+                dbx = get_dropbox_client() 
+
                 with st.spinner("⏳ Fetching image links from Dropbox..."):
                     links, failed = load_dropbox_image_links(dbx, FOLDER_PATH, total_images=80)
                 st.session_state.dropbox_image_links = links
@@ -620,7 +691,8 @@ def clean_and_archive_to_completed(dbx: dropbox.Dropbox, folder: str) -> tuple[i
 # Tab 2: Auto from Dropbox
 # =========================
 with tab_auto:
-    st.subheader("Auto-generate from Dropbox design folders")
+    mockup_source = st.selectbox("Mockup source", ["Dropbox", "Canva"], index=0)
+    st.subheader("Auto-generate from design folders")
 
     if not DESIGNS_ROOT:
         st.warning("Set `FOLDER_PATH_Design` in dpbox.env to your `/designs` root to use this tab.")
@@ -628,33 +700,47 @@ with tab_auto:
 
     dbx = get_dropbox_client()
 
+    if st.session_state.get("last_mockup_source") != mockup_source:
+        st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
+            dbx, DESIGNS_ROOT, mockup_source=mockup_source
+        )
+        st.session_state.last_mockup_source = mockup_source
+
     colA, colB = st.columns([1,1])
     with colA:
         if st.button("🔄 Refresh ready folders"):
-            ready, not_ready = analyze_design_folders(dbx, DESIGNS_ROOT)
+            ready, not_ready = analyze_design_folders(dbx, DESIGNS_ROOT, mockup_source=mockup_source)
             st.session_state.ready_folders = ready
             st.session_state.not_ready_folders = not_ready
 
     with colB:
         if not st.session_state.ready_folders:
-            ready, not_ready = analyze_design_folders(dbx, DESIGNS_ROOT)
+            ready, not_ready = analyze_design_folders(dbx, DESIGNS_ROOT, mockup_source=mockup_source)
             st.session_state.ready_folders = ready
             st.session_state.not_ready_folders = not_ready
 
     if "ready_folders" not in st.session_state or "not_ready_folders" not in st.session_state:
-        st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(dbx, DESIGNS_ROOT)
+        st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
+            dbx, DESIGNS_ROOT, mockup_source=mockup_source
+            )
 
     colA, colB = st.columns([1, 1])
     with colA:
         if st.button("🔄 Refresh folder analysis"):
-            st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(dbx, DESIGNS_ROOT)
+            st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
+                dbx, DESIGNS_ROOT, mockup_source=mockup_source
+            )
 
     ready_folders = st.session_state.ready_folders
     not_ready_info = st.session_state.not_ready_folders
 
+    if ready_folders:
+        folder = st.selectbox("Choose a ready folder", ready_folders, index=0)
+    else:
+        folder = None
+        st.info("No ready folders for the selected mockup source.")    
 
-    folder = st.selectbox("Choose a ready folder", ready_folders, index=0)
-    folder_path = f"{DESIGNS_ROOT}/{folder}"
+    folder_path = f"{DESIGNS_ROOT}/{folder}" if folder else None
 
     if not_ready_info:
         with st.expander("📂 Not Ready Folders"):
@@ -677,7 +763,7 @@ with tab_auto:
     variant_cap         = col5.number_input("Max variants to create this run (0 = no cap)",
                                             min_value=0, value=0, step=50)
 
-    if show_preview:
+    if show_preview and folder_path:
         try:
             entries = dbx.files_list_folder(folder_path).entries
             art = next(
@@ -694,11 +780,22 @@ with tab_auto:
             pass
 
     # -------- Build CSV (no upload) --------
-    if st.button("🧱 Build CSV (no upload)"):
+    if st.button("🧱 Build CSV (no upload)", disabled=folder is None):
         design_start = time.perf_counter()
         try:
             with st.status("Building design…", expanded=True) as s:
-                df, meta, missing = build_design_dataframe(dbx, folder, excluded_colors=excluded_colors)
+                #df, meta, missing = build_design_dataframe(dbx, folder, excluded_colors=excluded_colors)
+                sku_suffix_dbg = download_metadata(dbx, f"{DESIGNS_ROOT}/{folder}").get("sku_suffix", "").strip().upper()
+                s.write(f"Mockup source: {mockup_source}")
+                s.write(f"Folder: {folder}")
+                s.write(f"SKU from metadata: {sku_suffix_dbg}")
+
+                df, meta, missing = build_design_dataframe(
+                    dbx,
+                    folder,
+                    excluded_colors=excluded_colors,
+                    mockup_source=mockup_source,
+                )
 
                 if missing:
                     s.write(f"⚠️ Missing numbered images: {missing[:10]}{'…' if len(missing)>10 else ''}")
@@ -800,15 +897,28 @@ with tab_auto:
     if st.button("📦 Build CSV(s) for batch (no upload)"):
         batch_start = time.perf_counter()
         try:
+            st.session_state.batch_targets = []
             targets = [folder] if only_selected else list(ready_folders)
             dfs = []
+            built_targets = []
+            failed_builds = []
             for fname in targets:
-                df_i, _, _ = build_design_dataframe(dbx, fname, excluded_colors=excluded_colors)
-
-                dfs.append(df_i)
+                try:
+                    df_i, _, _ = build_design_dataframe(
+                        dbx,
+                        fname,
+                        excluded_colors=excluded_colors,
+                        mockup_source=mockup_source,
+                    )
+                    dfs.append(df_i)
+                    built_targets.append(fname)
+                except Exception as e:
+                    failed_builds.append((fname, str(e)))
 
             if not dfs:
                 st.warning("No dataframes built.")
+                for fname, reason in failed_builds:
+                    st.error(f"{fname}: {reason}")
                 st.stop()
 
             all_df = pd.concat(dfs, ignore_index=True)
@@ -831,7 +941,9 @@ with tab_auto:
 
             total_rows = sum(r for _, r, _ in built)
             st.success(f"Built {len(built)} CSV file(s) under {CSV_MAX_MB} MB each, total {total_rows} rows.")
-            st.session_state.batch_targets = targets
+            st.session_state.batch_targets = built_targets
+            for fname, reason in failed_builds:
+                st.warning(f"{fname}: {reason}")
 
         finally:
             st.info(f"⏱ Batch CSV build finished in {fmt_secs(time.perf_counter() - batch_start)}")
@@ -873,7 +985,13 @@ with tab_auto:
             with st.status(f"📦 {fname}: starting…", expanded=True) as s:
                 t0 = time.perf_counter()
                 try:
-                    df, meta, missing = build_design_dataframe(dbx, folder, excluded_colors=excluded_colors)
+                    #df, meta, missing = build_design_dataframe(dbx, folder, excluded_colors=excluded_colors)
+                    df, meta, missing = build_design_dataframe(
+                        dbx,
+                        fname,
+                        excluded_colors=excluded_colors,
+                        mockup_source=mockup_source,
+                    )   
 
                     if missing: s.write(f"⚠️ Missing images: {missing[:10]}{'…' if len(missing)>10 else ''}")
                     else: s.write("✅ All image links fetched")
