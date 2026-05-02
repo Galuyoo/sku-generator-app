@@ -242,21 +242,21 @@ def _render_listing_safety_check_body(validation: dict) -> None:
         st.caption(f"Metadata files checked: {metadata_checked}")
 
     if errors:
-        st.error("Fix listing safety errors before download, export, or upload.")
+        st.error("Must fix before export.")
     elif warnings:
-        st.warning("Listing checks passed with warnings. Export is allowed.")
+        st.warning("Review recommended improvements. Export is allowed.")
     else:
         st.success("Listing checks passed")
 
     if errors:
-        st.markdown("**Errors**")
-        for item in errors:
-            st.write(f"- {item}")
+        with st.expander("Must-fix details", expanded=True):
+            for item in errors:
+                st.write(f"- {item}")
 
     if warnings:
-        st.markdown("**Warnings**")
-        for item in warnings:
-            st.write(f"- {item}")
+        with st.expander("Recommended improvement details", expanded=not errors):
+            for item in warnings:
+                st.write(f"- {item}")
 
 
 def _render_listing_safety_checks(validation: dict, *, expanded: bool = False) -> None:
@@ -301,6 +301,9 @@ def render_action_summary(folder=None, sku_suffix=None, mockup_source=None, stor
         col3.metric("Mockups", mockup_source or "N/A")
         if store:
             st.caption(f"Target store: {store}")
+
+
+MANUAL_MIN_TAG_COUNT = 4
 
 
 def _split_manual_items(raw: str, *, allow_pipe_separator: bool = False) -> list[str]:
@@ -365,6 +368,43 @@ def _metadata_to_imageless_dataframe(metadata: dict) -> pd.DataFrame:
         page_titles=metadata.get("page_titles", []),
     )
     return ensure_shopify_csv_fields(df)
+
+
+def _render_manual_page_title_lengths(page_title_items: list[str]) -> None:
+    for index, title in enumerate(page_title_items, start=1):
+        length = len(title)
+        if length >= 70:
+            st.error(f"{index}. {length} chars - {title}")
+        else:
+            st.write(f"{index}. {length} chars - {title}")
+
+
+def _build_manual_example_listing(expected_item_count: int) -> dict:
+    descriptions = []
+    for index in range(1, expected_item_count + 1):
+        descriptions.append(
+            "This safe test listing description is written for manual builder checks. "
+            "It describes a comfortable graphic garment with a clean print, everyday styling, "
+            "and an easy gifting angle for customers browsing Shopify. "
+            f"Example item {index} keeps the text unique while avoiding brand names, restricted terms, "
+            "or claims that would need extra review. It is intentionally long enough to exercise "
+            "the listing validation preview without relying on Dropbox images."
+        )
+
+    return {
+        "product_name": "Test Tag",
+        "sku_suffix": "TESTMANUAL",
+        "main_color": "Black",
+        "tags": "test listing, graphic tee, gift idea, casual wear, unisex style, manual builder",
+        "page_titles": "\n".join(
+            f"Test Tag {garment} | Classic Graphic Style"
+            for garment in garment_keys[:expected_item_count]
+        ),
+        "descriptions": "\n".join(descriptions),
+        "lister": "Sal",
+        "track_sku": False,
+        "output_mode": "Both JSON and CSV",
+    }
 
 
 # ---------- Streamlit config ----------
@@ -676,21 +716,83 @@ with tab_manual:
     if "manual_listing_builder" not in st.session_state:
         st.session_state.manual_listing_builder = None
 
-    with st.form("manual_listing_builder_form"):
-        output_mode = st.radio(
-            "Build output",
-            ["Metadata JSON only", "Imageless CSV only", "Both JSON and CSV"],
-            horizontal=True,
+    manual_expected_count = len(garment_keys)
+    manual_defaults = {
+        "manual_output_mode": "Metadata JSON only",
+        "manual_product_name": "",
+        "manual_sku_suffix": "",
+        "manual_main_color": "",
+        "manual_tags": "",
+        "manual_page_titles": "",
+        "manual_descriptions": "",
+        "manual_lister": "Sal",
+        "manual_track_sku": False,
+    }
+    for key, value in manual_defaults.items():
+        st.session_state.setdefault(key, value)
+
+    action_col1, action_col2 = st.columns(2)
+    if action_col1.button("Fill example test listing"):
+        example = _build_manual_example_listing(manual_expected_count)
+        st.session_state.manual_output_mode = example["output_mode"]
+        st.session_state.manual_product_name = example["product_name"]
+        st.session_state.manual_sku_suffix = example["sku_suffix"]
+        st.session_state.manual_main_color = example["main_color"]
+        st.session_state.manual_tags = example["tags"]
+        st.session_state.manual_page_titles = example["page_titles"]
+        st.session_state.manual_descriptions = example["descriptions"]
+        st.session_state.manual_lister = example["lister"]
+        st.session_state.manual_track_sku = example["track_sku"]
+        st.session_state.manual_listing_builder = None
+        st.rerun()
+
+    if action_col2.button("Clear manual form"):
+        for key, value in manual_defaults.items():
+            st.session_state[key] = value
+        st.session_state.manual_listing_builder = None
+        st.rerun()
+
+    output_mode = st.radio(
+        "Build output",
+        ["Metadata JSON only", "Imageless CSV only", "Both JSON and CSV"],
+        horizontal=True,
+        key="manual_output_mode",
+    )
+    product_name = st.text_input("Product name", key="manual_product_name")
+    sku_suffix = st.text_input("SKU suffix", key="manual_sku_suffix").strip().upper()
+    main_color = st.text_input("Main color", key="manual_main_color").strip()
+    tags = st.text_input("Tags, comma-separated", key="manual_tags").strip()
+    tag_count = len([tag.strip() for tag in tags.split(",") if tag.strip()])
+    st.caption(f"Tags: {tag_count}")
+    if tags and tag_count < MANUAL_MIN_TAG_COUNT:
+        st.warning(
+            f"Recommended: add at least {MANUAL_MIN_TAG_COUNT} tags. "
+            f"You currently have {tag_count}."
         )
-        product_name = st.text_input("Product name")
-        sku_suffix = st.text_input("SKU suffix").strip().upper()
-        main_color = st.text_input("Main color").strip()
-        tags = st.text_input("Tags, comma-separated").strip()
-        page_titles = st.text_area("Page titles", height=160)
-        descriptions = st.text_area("Descriptions", height=300)
-        lister = st.selectbox("Lister", ["Sal", "Hannan"])
-        track_sku = st.checkbox("Enable SKU tracking")
-        submit = st.form_submit_button("Build listing")
+
+    page_titles = st.text_area("Page titles", height=160, key="manual_page_titles")
+    page_title_items = _split_manual_items(page_titles, allow_pipe_separator=False)
+    st.caption(f"Page titles: {len(page_title_items)} / {manual_expected_count}")
+    if page_title_items and len(page_title_items) != manual_expected_count:
+        st.warning(f"Paste one page title per line. You have {len(page_title_items)}; expected {manual_expected_count}.")
+
+    if page_title_items:
+        with st.expander("Page title length preview", expanded=False):
+            try:
+                with st.container(height=260):
+                    _render_manual_page_title_lengths(page_title_items)
+            except TypeError:
+                _render_manual_page_title_lengths(page_title_items)
+
+    descriptions = st.text_area("Descriptions", height=300, key="manual_descriptions")
+    description_items = _split_manual_items(descriptions, allow_pipe_separator=False)
+    st.caption(f"Descriptions: {len(description_items)} / {manual_expected_count}")
+    if description_items and len(description_items) != manual_expected_count:
+        st.warning(f"Paste one description per line. You have {len(description_items)}; expected {manual_expected_count}.")
+
+    lister = st.selectbox("Lister", ["Sal", "Hannan"], key="manual_lister")
+    track_sku = st.checkbox("Enable SKU tracking", key="manual_track_sku")
+    submit = st.button("Build listing")
 
     if submit:
         st.session_state.generating = True
@@ -707,7 +809,11 @@ with tab_manual:
             sku_label = metadata.get("sku_suffix") or "Manual listing"
             wants_json = output_mode in {"Metadata JSON only", "Both JSON and CSV"}
             wants_csv = output_mode in {"Imageless CSV only", "Both JSON and CSV"}
-            metadata_validation = validate_listing_metadata(metadata, label=sku_label)
+            metadata_validation = validate_listing_metadata(
+                metadata,
+                label=sku_label,
+                min_tag_count=MANUAL_MIN_TAG_COUNT,
+            )
             csv_validation = None
             df = None
             tracking_error = None
@@ -764,41 +870,47 @@ with tab_manual:
         if not manual_result["has_blocking_errors"]:
             metadata = manual_result["metadata"]
             if manual_result["wants_json"]:
-                st.download_button(
-                    "Download metadata JSON",
-                    data=_metadata_to_json_bytes(metadata),
-                    file_name=manual_result["json_filename"],
-                    mime="application/json",
-                )
+                with st.container(border=True):
+                    st.markdown("#### Metadata JSON")
+                    st.caption(manual_result["json_filename"])
+                    st.download_button(
+                        "Download metadata JSON",
+                        data=_metadata_to_json_bytes(metadata),
+                        file_name=manual_result["json_filename"],
+                        mime="application/json",
+                    )
 
             if manual_result["wants_csv"]:
                 df = manual_result["df"]
                 csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "Download imageless CSV",
-                    data=csv_bytes,
-                    file_name=manual_result["csv_filename"],
-                    mime="text/csv",
-                )
+                with st.container(border=True):
+                    st.markdown("#### Imageless CSV")
+                    st.caption(manual_result["csv_filename"])
+                    st.download_button(
+                        "Download imageless CSV",
+                        data=csv_bytes,
+                        file_name=manual_result["csv_filename"],
+                        mime="text/csv",
+                    )
 
-                if st.button("Send to Shopify"):
-                    with st.status("Uploading to Shopify...", expanded=True) as s:
-                        try:
-                            def emit(msg: str): s.write(msg)
-                            results = upload_products_from_df(df, progress=emit)
-                            s.update(label="Upload complete")
-                            st.success(f"Uploaded {len(results)} products.")
-                            st.json(results)
-                        except ShopifyError as e:
-                            if str(e).startswith("DAILY_VARIANT_LIMIT:"):
-                                s.update(label="Daily variant creation limit hit")
-                                st.error("You've hit Shopify's daily variant creation limit. Use CSV import now or resume via API tomorrow.")
-                            else:
-                                s.update(label="Shopify upload failed")
-                                st.error(f"Shopify error: {e}")
-                        except Exception as e:
-                            s.update(label="Unexpected error during upload")
-                            st.error(f"Unexpected error: {e}")
+                    if st.button("Send to Shopify"):
+                        with st.status("Uploading to Shopify...", expanded=True) as s:
+                            try:
+                                def emit(msg: str): s.write(msg)
+                                results = upload_products_from_df(df, progress=emit)
+                                s.update(label="Upload complete")
+                                st.success(f"Uploaded {len(results)} products.")
+                                st.json(results)
+                            except ShopifyError as e:
+                                if str(e).startswith("DAILY_VARIANT_LIMIT:"):
+                                    s.update(label="Daily variant creation limit hit")
+                                    st.error("You've hit Shopify's daily variant creation limit. Use CSV import now or resume via API tomorrow.")
+                                else:
+                                    s.update(label="Shopify upload failed")
+                                    st.error(f"Shopify error: {e}")
+                            except Exception as e:
+                                s.update(label="Unexpected error during upload")
+                                st.error(f"Unexpected error: {e}")
 
                 with st.expander("Preview Descriptions"):
                     key_col = "Base Type" if "Base Type" in df.columns else "Type"

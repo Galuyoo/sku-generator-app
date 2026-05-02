@@ -132,6 +132,7 @@ def validate_shopify_dataframe(
     *,
     seo_title_max_chars: int = SEO_TITLE_MAX_CHARS,
     seo_description_min_chars: int = SEO_DESCRIPTION_MIN_CHARS,
+    tag_min_count: int = 4,
     label: str | None = None,
 ) -> dict[str, Any]:
     result = empty_validation_result()
@@ -149,6 +150,8 @@ def validate_shopify_dataframe(
     missing_columns = [column for column in REQUIRED_CSV_COLUMNS if column not in df.columns]
     if missing_columns:
         _error(result, f"Generated CSV is missing required columns: {', '.join(missing_columns)}", label)
+
+    product_rows = _product_level_rows(df)
 
     if {"Handle", "Title"}.issubset(df.columns):
         handles = _text_series(df["Handle"])
@@ -181,13 +184,13 @@ def validate_shopify_dataframe(
                 label,
             )
 
-    if "SEO Title" in df.columns:
-        seo_titles = _text_series(df["SEO Title"])
+    if "SEO Title" in product_rows.columns:
+        seo_titles = _text_series(product_rows["SEO Title"])
         too_long_mask = seo_titles.ne("") & seo_titles.str.len().ge(seo_title_max_chars)
         if too_long_mask.any():
             details = [
-                f"row {row}: {title} ({len(title)} chars)"
-                for row, title in _row_value_pairs(seo_titles, too_long_mask)[:8]
+                f"{handle} (row {row}): {title} ({len(title)} chars)"
+                for handle, row, title in _product_value_details(product_rows, seo_titles, too_long_mask)[:8]
             ]
             _error(
                 result,
@@ -195,18 +198,44 @@ def validate_shopify_dataframe(
                 label,
             )
 
-    if "SEO Description" in df.columns:
-        seo_descriptions = _text_series(df["SEO Description"])
+    if "SEO Description" in product_rows.columns:
+        seo_descriptions = _text_series(product_rows["SEO Description"])
 
-        bootleg_rows = _row_numbers(seo_descriptions.str.contains(BOOTLEG_RE, na=False))
-        if bootleg_rows:
-            _error(result, f"SEO Description contains 'Bootleg' at CSV rows: {_sample(bootleg_rows)}", label)
+        bootleg_mask = seo_descriptions.str.contains(BOOTLEG_RE, na=False)
+        if bootleg_mask.any():
+            bootleg_details = [
+                f"{handle} (row {row})"
+                for handle, row, _ in _product_value_details(product_rows, seo_descriptions, bootleg_mask)
+            ]
+            _error(result, f"SEO Description contains 'Bootleg' for products: {_sample(bootleg_details)}", label)
 
-        short_rows = _row_numbers(seo_descriptions.str.len().lt(seo_description_min_chars))
-        if short_rows:
+        short_mask = seo_descriptions.ne("") & seo_descriptions.str.len().lt(seo_description_min_chars)
+        if short_mask.any():
+            short_details = [
+                f"{handle} (row {row})"
+                for handle, row, _ in _product_value_details(product_rows, seo_descriptions, short_mask)
+            ]
             _warning(
                 result,
-                f"SEO Description is under {seo_description_min_chars} characters at CSV rows: {_sample(short_rows)}",
+                f"SEO Description is under {seo_description_min_chars} characters for products: {_sample(short_details)}",
+                label,
+            )
+
+    if "Tags" in product_rows.columns:
+        tags = _text_series(product_rows["Tags"])
+        non_empty_tags = tags[tags.ne("")]
+        short_tag_details = []
+        for index, value in non_empty_tags.items():
+            tag_parts = [tag.strip() for tag in value.split(",") if tag.strip()]
+            if len(tag_parts) < tag_min_count:
+                row = int(product_rows.loc[index, "_validation_row"])
+                handle = _product_detail_handle(product_rows, index)
+                short_tag_details.append(f"{handle} (row {row})")
+
+        if short_tag_details:
+            _warning(
+                result,
+                f"Tags should include at least {tag_min_count} non-empty tags for products: {_sample(short_tag_details)}",
                 label,
             )
 
@@ -396,6 +425,43 @@ def _text_series(series: pd.Series) -> pd.Series:
 def _non_empty_series(series: pd.Series) -> pd.Series:
     cleaned = _text_series(series)
     return cleaned[cleaned.ne("")]
+
+
+def _product_level_rows(df: pd.DataFrame) -> pd.DataFrame:
+    source = df.copy().reset_index(drop=True)
+    source["_validation_row"] = range(2, len(source) + 2)
+
+    if "Handle" not in df.columns:
+        return source
+
+    handles = _text_series(source["Handle"])
+    source["_validation_handle"] = handles
+    source = source[source["_validation_handle"].ne("")]
+    return source.drop_duplicates(subset=["_validation_handle"], keep="first")
+
+
+def _product_detail_handle(source: pd.DataFrame, index: Any) -> str:
+    if "_validation_handle" in source.columns:
+        handle = _clean_text(source.loc[index, "_validation_handle"])
+        if handle:
+            return handle
+    if "Title" in source.columns:
+        title = _clean_text(source.loc[index, "Title"])
+        if title:
+            return title
+    return "product"
+
+
+def _product_value_details(
+    source: pd.DataFrame,
+    series: pd.Series,
+    mask: pd.Series,
+) -> list[tuple[str, int, str]]:
+    details = []
+    for index, value in series[mask].items():
+        row = int(source.loc[index, "_validation_row"]) if "_validation_row" in source.columns else int(index) + 2
+        details.append((_product_detail_handle(source, index), row, value))
+    return details
 
 
 def _case_insensitive_duplicates(values: list[str]) -> list[str]:
