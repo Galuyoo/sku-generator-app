@@ -303,6 +303,70 @@ def render_action_summary(folder=None, sku_suffix=None, mockup_source=None, stor
             st.caption(f"Target store: {store}")
 
 
+def _split_manual_items(raw: str, *, allow_pipe_separator: bool = False) -> list[str]:
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) > 1:
+        return lines
+
+    if allow_pipe_separator:
+        return [part.strip() for part in raw.split("|") if part.strip()]
+
+    return lines
+
+
+def _build_manual_metadata(
+    product_name: str,
+    sku_suffix: str,
+    main_color: str,
+    tags: str,
+    page_titles: str,
+    descriptions: str,
+) -> dict:
+    return {
+        "product_name": (product_name or "").strip(),
+        "sku_suffix": (sku_suffix or "").strip().upper(),
+        "main_color": (main_color or "").strip(),
+        "tags": [tag.strip() for tag in (tags or "").split(",") if tag.strip()],
+        "page_titles": _split_manual_items(page_titles, allow_pipe_separator=False),
+        "descriptions": _split_manual_items(descriptions, allow_pipe_separator=False),
+    }
+
+
+def _metadata_to_json_bytes(metadata: dict) -> bytes:
+    return json.dumps(metadata, indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def _metadata_to_imageless_dataframe(metadata: dict) -> pd.DataFrame:
+    tags_csv = ", ".join(str(tag).strip() for tag in metadata.get("tags", []) if str(tag).strip())
+    df = generate_sku_dataframe(
+        product_name=metadata.get("product_name", ""),
+        sku_suffix=metadata.get("sku_suffix", ""),
+        main_color=metadata.get("main_color", ""),
+        tags=tags_csv,
+        garment_keys=garment_keys,
+        raw_descriptions=metadata.get("descriptions", []),
+        body_html_map=body_html_map,
+        product_extras=product_extras,
+        product_types=product_types,
+        correct_colors_by_type=correct_colors_by_type,
+        vendor=vendor,
+        published=published,
+        inventory_policy=inventory_policy,
+        fulfillment_service=fulfillment_service,
+        requires_shipping=requires_shipping,
+        taxable=taxable,
+        inventory_tracker=inventory_tracker,
+        image_links=None,
+        excluded_colors=excluded_colors,
+        page_titles=metadata.get("page_titles", []),
+    )
+    return ensure_shopify_csv_fields(df)
+
+
 # ---------- Streamlit config ----------
 st.set_page_config(page_title="SKU Generator", layout="centered")
 
@@ -601,104 +665,154 @@ excluded_colors = st.multiselect(
 
 
 # ---------- Tabs ----------
-tab_manual, tab_auto = st.tabs(["📝 Manual entry", "🤖 Auto from Dropbox"])
+tab_manual, tab_auto = st.tabs(["Manual listing builder", "🤖 Auto from Dropbox"])
 
 # =========================
-# Tab 1: Manual entry
+# Tab 1: Manual listing builder
 # =========================
 with tab_manual:
-    with st.form("sku_form"):
-        product_name = st.text_input("Enter product name")
-        sku_suffix   = st.text_input("Enter unique SKU suffix (e.g., IVARLULE)").strip().upper()
-        main_color   = st.text_input("Enter main color (e.g., Black)").strip()
-        tags         = st.text_input("Enter comma-separated tags").strip()
-        lister       = st.selectbox("Who is listing this?", ["Sal", "Hannan"])
-        st.markdown("**Enter 10 product descriptions, separated by `|`**")
-        raw_descriptions = st.text_area("Descriptions", height=300).strip()
-        submit = st.form_submit_button("Generate CSV")
+    render_section_header("Manual listing builder")
+
+    if "manual_listing_builder" not in st.session_state:
+        st.session_state.manual_listing_builder = None
+
+    with st.form("manual_listing_builder_form"):
+        output_mode = st.radio(
+            "Build output",
+            ["Metadata JSON only", "Imageless CSV only", "Both JSON and CSV"],
+            horizontal=True,
+        )
+        product_name = st.text_input("Product name")
+        sku_suffix = st.text_input("SKU suffix").strip().upper()
+        main_color = st.text_input("Main color").strip()
+        tags = st.text_input("Tags, comma-separated").strip()
+        page_titles = st.text_area("Page titles", height=160)
+        descriptions = st.text_area("Descriptions", height=300)
+        lister = st.selectbox("Lister", ["Sal", "Hannan"])
+        track_sku = st.checkbox("Enable SKU tracking")
+        submit = st.form_submit_button("Build listing")
 
     if submit:
         st.session_state.generating = True
+        st.session_state.manual_listing_builder = None
         try:
-            desc_list = [d.strip() for d in raw_descriptions.split("|") if d.strip()]
-            if len(desc_list) != len(garment_keys):
-                st.error(f"❌ You provided {len(desc_list)} descriptions but {len(garment_keys)} are required.")
-                st.stop()
-            if not all([product_name, sku_suffix, main_color, tags, lister]):
-                st.warning("⚠️ Please complete all fields.")
-                st.stop()
-
-            sheet = connect_to_sheet("SKU Tracker")
-            existing_suffixes = [row[0].strip().upper() for row in sheet.get_all_values()[1:]]
-            if sku_suffix in existing_suffixes:
-                st.error("❌ That SKU suffix is already used in Google Sheets. Please enter a new one.")
-                st.stop()
-            sheet.append_row([sku_suffix, lister, datetime.now().isoformat()])
-
-            image_links = st.session_state.dropbox_image_links if st.session_state.dropbox_links_loaded else None
-
-            df = generate_sku_dataframe(
-                product_name, sku_suffix, main_color, tags,
-                garment_keys, desc_list,
-                body_html_map, product_extras, product_types, correct_colors_by_type,
-                vendor, published, inventory_policy, fulfillment_service, requires_shipping, taxable, inventory_tracker,
-                image_links=image_links,excluded_colors=excluded_colors,
+            metadata = _build_manual_metadata(
+                product_name=product_name,
+                sku_suffix=sku_suffix,
+                main_color=main_color,
+                tags=tags,
+                page_titles=page_titles,
+                descriptions=descriptions,
             )
+            sku_label = metadata.get("sku_suffix") or "Manual listing"
+            wants_json = output_mode in {"Metadata JSON only", "Both JSON and CSV"}
+            wants_csv = output_mode in {"Imageless CSV only", "Both JSON and CSV"}
+            metadata_validation = validate_listing_metadata(metadata, label=sku_label)
+            csv_validation = None
+            df = None
+            tracking_error = None
 
-            # >>> Your requested CSV fields <<<
-            df = ensure_shopify_csv_fields(df)
+            if track_sku and metadata.get("sku_suffix"):
+                sheet = connect_to_sheet("SKU Tracker")
+                existing_suffixes = [row[0].strip().upper() for row in sheet.get_all_values()[1:] if row]
+                if metadata["sku_suffix"] in existing_suffixes:
+                    tracking_error = "That SKU suffix is already used in Google Sheets. Please enter a new one."
 
-            csv_validation = validate_shopify_dataframe(df, label=sku_suffix)
-            _render_listing_safety_checks(csv_validation)
+            if wants_csv and not has_validation_errors(metadata_validation):
+                df = _metadata_to_imageless_dataframe(metadata)
+                csv_validation = validate_shopify_dataframe(df, label=sku_label)
 
-            if has_validation_errors(csv_validation):
-                st.error("CSV export and Shopify upload blocked by listing safety errors.")
-            else:
-                filename = f"{sku_suffix}.csv"
-                df.to_csv(filename, index=False, encoding="utf-8-sig")
-                with open(filename, "rb") as f:
-                    st.download_button("📥 Download CSV File", f, file_name=filename)
+            has_blocking_errors = has_validation_errors(metadata_validation) or bool(tracking_error)
+            if wants_csv:
+                has_blocking_errors = has_blocking_errors or df is None or has_validation_errors(csv_validation or {})
 
-                if st.button("Send to Shopify"):
-                    with st.status("🚀 Uploading to Shopify…", expanded=True) as s:
-                        try:
-                            def emit(msg: str): s.write(msg)
-                            results = upload_products_from_df(df, progress=emit)
-                            s.update(label="✅ Upload complete")
-                            st.success(f"Uploaded {len(results)} products.")
-                            st.json(results)
-                        except ShopifyError as e:
-                            if str(e).startswith("DAILY_VARIANT_LIMIT:"):
-                                s.update(label="⛔ Daily variant creation limit hit")
-                                st.error("You’ve hit Shopify’s daily variant creation limit. Use CSV import now or resume via API tomorrow.")
-                            else:
-                                s.update(label="❌ Shopify upload failed")
-                                st.error(f"Shopify error: {e}")
-                        except Exception as e:
-                            s.update(label="❌ Unexpected error during upload")
-                            st.error(f"Unexpected error: {e}")
+            if track_sku and not has_blocking_errors:
+                sheet = connect_to_sheet("SKU Tracker")
+                sheet.append_row([metadata["sku_suffix"], lister, datetime.now().isoformat()])
 
-            with st.expander("📝 Preview Descriptions"):
-                key_col = "Base Type" if "Base Type" in df.columns else "Type"
-
-                for garment in garment_keys:
-                    st.markdown(f"**{garment}**", unsafe_allow_html=True)
-
-                    sub = df[df[key_col] == garment]
-                    if sub.empty:
-                        st.warning(f"No rows found for '{garment}' (preview only).")
-                        st.markdown("---")
-                        continue
-
-                    st.markdown(sub.iloc[0]["Body (HTML)"], unsafe_allow_html=True)
-                    st.markdown("---")
-                    
+            st.session_state.manual_listing_builder = {
+                "mode": output_mode,
+                "wants_json": wants_json,
+                "wants_csv": wants_csv,
+                "metadata": metadata,
+                "metadata_validation": metadata_validation,
+                "df": df,
+                "csv_validation": csv_validation,
+                "tracking_error": tracking_error,
+                "has_blocking_errors": has_blocking_errors,
+                "json_filename": f"{metadata.get('sku_suffix', '').strip().upper()}_metadata.json",
+                "csv_filename": f"{metadata.get('sku_suffix', '').strip().upper()}.csv",
+            }
         except Exception as e:
-            st.error("❌ Something went wrong while generating the CSV.")
+            st.error("Something went wrong while building the manual listing.")
             st.exception(e)
         finally:
             st.session_state.generating = False
 
+    manual_result = st.session_state.manual_listing_builder
+    if manual_result:
+        st.markdown("#### Metadata validation")
+        _render_listing_safety_checks(manual_result["metadata_validation"])
+
+        if manual_result.get("tracking_error"):
+            st.error(manual_result["tracking_error"])
+
+        if manual_result["wants_csv"] and manual_result.get("csv_validation"):
+            st.markdown("#### CSV validation")
+            _render_listing_safety_checks(manual_result["csv_validation"])
+
+        if not manual_result["has_blocking_errors"]:
+            metadata = manual_result["metadata"]
+            if manual_result["wants_json"]:
+                st.download_button(
+                    "Download metadata JSON",
+                    data=_metadata_to_json_bytes(metadata),
+                    file_name=manual_result["json_filename"],
+                    mime="application/json",
+                )
+
+            if manual_result["wants_csv"]:
+                df = manual_result["df"]
+                csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "Download imageless CSV",
+                    data=csv_bytes,
+                    file_name=manual_result["csv_filename"],
+                    mime="text/csv",
+                )
+
+                if st.button("Send to Shopify"):
+                    with st.status("Uploading to Shopify...", expanded=True) as s:
+                        try:
+                            def emit(msg: str): s.write(msg)
+                            results = upload_products_from_df(df, progress=emit)
+                            s.update(label="Upload complete")
+                            st.success(f"Uploaded {len(results)} products.")
+                            st.json(results)
+                        except ShopifyError as e:
+                            if str(e).startswith("DAILY_VARIANT_LIMIT:"):
+                                s.update(label="Daily variant creation limit hit")
+                                st.error("You've hit Shopify's daily variant creation limit. Use CSV import now or resume via API tomorrow.")
+                            else:
+                                s.update(label="Shopify upload failed")
+                                st.error(f"Shopify error: {e}")
+                        except Exception as e:
+                            s.update(label="Unexpected error during upload")
+                            st.error(f"Unexpected error: {e}")
+
+                with st.expander("Preview Descriptions"):
+                    key_col = "Base Type" if "Base Type" in df.columns else "Type"
+                    for garment in garment_keys:
+                        st.markdown(f"**{garment}**", unsafe_allow_html=True)
+
+                        sub = df[df[key_col] == garment]
+                        if sub.empty:
+                            st.warning(f"No rows found for '{garment}' (preview only).")
+                            st.markdown("---")
+                            continue
+
+                        st.markdown(sub.iloc[0]["Body (HTML)"], unsafe_allow_html=True)
+                        st.markdown("---")
 # ------------------------------------------------------------
 # Helpers for Auto tab
 # ------------------------------------------------------------
