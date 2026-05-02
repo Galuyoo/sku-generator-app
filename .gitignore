@@ -39,6 +39,6 @@ aqueous-charger-*.json
 out/
 reports/
 
-# Data files (optional — only if you don't want them in git)
+# Data files
 *.csv
 .logo.png
