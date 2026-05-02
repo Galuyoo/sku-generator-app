@@ -22,6 +22,11 @@ from utils.listing_validation import (
     validate_listing_metadata,
     validate_shopify_dataframe,
 )
+from utils.mockup_zip_intake import (
+    extract_mockup_images,
+    inspect_mockup_zip,
+    upload_mockup_images_to_dropbox,
+)
 from utils.dropbox_utils import (
     get_dropbox_client,
     get_shared_link,     # used for art preview
@@ -496,6 +501,7 @@ if missing:
 
 FOLDER_PATH  = os.getenv("FOLDER_PATH", "").strip()
 DESIGNS_ROOT = os.getenv("FOLDER_PATH_Design", "").strip()
+MOCKUP_ZIP_EXPECTED_IMAGES = int(os.getenv("MOCKUP_ZIP_EXPECTED_IMAGES", "80") or "80")
 
 # ---------- Session defaults ----------
 if "generating" not in st.session_state: st.session_state.generating = False
@@ -988,6 +994,17 @@ def _ensure_folder(dbx: dropbox.Dropbox, path: str):
     if not _dbx_exists(dbx, path):
         dbx.files_create_folder_v2(path)
 
+def _dropbox_folder_has_metadata(dbx: dropbox.Dropbox, folder_path: str) -> bool:
+    try:
+        entries = dbx.files_list_folder(folder_path).entries
+    except Exception:
+        return False
+    return any(
+        isinstance(entry, dropbox.files.FileMetadata)
+        and entry.name.lower().endswith(".json")
+        for entry in entries
+    )
+
 def move_selected_to_finished(dbx: dropbox.Dropbox, folder: str) -> str:
     from utils.dropbox_utils import move_to_finished, get_dropbox_client
     final_path = move_to_finished(get_dropbox_client(), DESIGNS_ROOT, folder, finished_dir=FINISHED_DIR_NAME)
@@ -1091,6 +1108,135 @@ with tab_auto:
                 st.data_editor(df_not_ready, disabled=True, width="stretch")
             else:
                 st.success("All folders are ready.")
+
+        with st.container(border=True):
+            render_section_header("Mockup ZIP intake")
+            uploaded_zips = st.file_uploader(
+                "Upload Canva mockup ZIP",
+                type=["zip"],
+                accept_multiple_files=True,
+                key="mockup_zip_uploader",
+            )
+            overwrite_mockups = st.checkbox(
+                "Overwrite existing numbered images",
+                value=False,
+                key="mockup_zip_overwrite",
+            )
+
+            zip_previews = []
+            if uploaded_zips:
+                for uploaded_zip in uploaded_zips:
+                    inspection = inspect_mockup_zip(
+                        uploaded_zip,
+                        expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                    )
+                    sku = inspection["sku"]
+                    target_folder_path = f"{DESIGNS_ROOT}/{sku}" if sku else ""
+                    target_exists = bool(target_folder_path and _dbx_exists(dbx, target_folder_path))
+                    metadata_exists = bool(target_exists and _dropbox_folder_has_metadata(dbx, target_folder_path))
+
+                    errors = list(inspection["errors"])
+                    warnings = list(inspection["warnings"])
+                    if sku and not target_exists:
+                        errors.append(f"Target folder not found: {target_folder_path}")
+                    if target_exists and not metadata_exists:
+                        errors.append("Metadata JSON is missing in target folder.")
+
+                    status = "Blocked" if errors else "Ready with warnings" if warnings else "Ready"
+                    zip_previews.append({
+                        "ZIP file": inspection["filename"],
+                        "Detected SKU": sku,
+                        "Target folder exists": target_exists,
+                        "Metadata exists": metadata_exists,
+                        "Images found": inspection["images_found"],
+                        "Status": status,
+                        "Errors": "; ".join(errors),
+                        "Warnings": "; ".join(warnings),
+                        "_uploaded_file": uploaded_zip,
+                        "_target_folder_path": target_folder_path,
+                        "_blocked": bool(errors),
+                    })
+
+                preview_df = pd.DataFrame([
+                    {key: value for key, value in row.items() if not key.startswith("_")}
+                    for row in zip_previews
+                ])
+                st.data_editor(
+                    preview_df,
+                    disabled=True,
+                    width="stretch",
+                    key="mockup_zip_preview_table",
+                )
+
+            if st.button("Upload mockups to Dropbox", disabled=not uploaded_zips, key="mockup_zip_upload_btn"):
+                if not zip_previews:
+                    st.warning("Upload at least one ZIP file first.")
+                else:
+                    successful_upload = False
+                    upload_rows = []
+                    with st.status("Uploading mockups to Dropbox...", expanded=True) as s:
+                        for row in zip_previews:
+                            zip_name = row["ZIP file"]
+                            if row["_blocked"]:
+                                s.write(f"{zip_name}: blocked - {row['Errors']}")
+                                upload_rows.append({
+                                    "ZIP file": zip_name,
+                                    "Uploaded": 0,
+                                    "Skipped": 0,
+                                    "Failed": 0,
+                                    "Truncated": 0,
+                                    "Status": "Blocked",
+                                })
+                                continue
+
+                            try:
+                                images = extract_mockup_images(row["_uploaded_file"])
+                                result = upload_mockup_images_to_dropbox(
+                                    dbx,
+                                    row["_target_folder_path"],
+                                    images,
+                                    overwrite=overwrite_mockups,
+                                    expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                                )
+                                successful_upload = successful_upload or result["uploaded"] > 0
+                                upload_rows.append({
+                                    "ZIP file": zip_name,
+                                    "Uploaded": result["uploaded"],
+                                    "Skipped": result["skipped"],
+                                    "Failed": result["failed"],
+                                    "Truncated": result["truncated"],
+                                    "Status": "Done" if result["failed"] == 0 else "Completed with failures",
+                                })
+                                s.write(
+                                    f"{zip_name}: uploaded {result['uploaded']}, "
+                                    f"skipped {result['skipped']}, failed {result['failed']}."
+                                )
+                            except Exception as e:
+                                upload_rows.append({
+                                    "ZIP file": zip_name,
+                                    "Uploaded": 0,
+                                    "Skipped": 0,
+                                    "Failed": 1,
+                                    "Truncated": 0,
+                                    "Status": str(e),
+                                })
+                                s.write(f"{zip_name}: failed - {e}")
+
+                        if successful_upload:
+                            st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
+                                dbx, DESIGNS_ROOT, mockup_source=mockup_source
+                            )
+                            ready_folders = st.session_state.get("ready_folders", [])
+                            not_ready_info = st.session_state.get("not_ready_folders", [])
+                            s.update(label="Upload complete. Folder analysis refreshed.")
+                        else:
+                            s.update(label="Upload finished. No new files were uploaded.")
+
+                    st.dataframe(
+                        pd.DataFrame(upload_rows),
+                        width="stretch",
+                        key="mockup_zip_upload_results_table",
+                    )
 
         with st.container(border=True):
             render_section_header("Selected design")
