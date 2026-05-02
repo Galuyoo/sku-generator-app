@@ -42,3 +42,5 @@ reports/
 # Data files
 *.csv
 .logo.png
+
+config.json
