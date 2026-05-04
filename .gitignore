@@ -42,3 +42,7 @@ reports/
 # Data files
 *.csv
 .logo.png
+
+# Local agent skills
+.agents/
+skills-lock.json
