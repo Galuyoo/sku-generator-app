@@ -275,6 +275,13 @@ def _render_auto_listing_safety_overview() -> None:
         _render_listing_safety_check_body(st.session_state.auto_validation)
         shown = True
 
+    if st.session_state.get("auto_upload_validation"):
+        if shown:
+            st.divider()
+        st.markdown("#### Selected CSV upload")
+        _render_listing_safety_check_body(st.session_state.auto_upload_validation)
+        shown = True
+
     if st.session_state.get("batch_validation"):
         if shown:
             st.divider()
@@ -408,7 +415,9 @@ if "auto_csv_name" not in st.session_state: st.session_state.auto_csv_name = Non
 if "auto_folder" not in st.session_state: st.session_state.auto_folder = None
 if "auto_meta" not in st.session_state: st.session_state.auto_meta = None
 if "auto_validation" not in st.session_state: st.session_state.auto_validation = None
+if "auto_upload_validation" not in st.session_state: st.session_state.auto_upload_validation = None
 if "batch_validation" not in st.session_state: st.session_state.batch_validation = None
+if "batch_only_selected" not in st.session_state: st.session_state.batch_only_selected = False
 
 # ---------- Small helpers ----------
 def ensure_image_src_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -928,6 +937,7 @@ with tab_auto:
                 design_start = time.perf_counter()
                 build_succeeded = False
                 st.session_state.auto_validation = None
+                st.session_state.auto_upload_validation = None
                 try:
                     with st.status("Building selected design...", expanded=True) as s:
                         meta = download_metadata(dbx, f"{DESIGNS_ROOT}/{folder}")
@@ -999,7 +1009,6 @@ with tab_auto:
         else:
             only_selected = st.checkbox(
                 "Only include selected folder",
-                value=only_selected,
                 key="batch_only_selected",
             )
             batch_build_disabled = (only_selected and folder is None) or (not only_selected and not ready_folders)
@@ -1154,7 +1163,7 @@ with tab_auto:
                         else:
                             pending_tracker_row = [sku_suffix, "StreamlitAuto", datetime.now().isoformat()]
 
-                    st.session_state.auto_validation = upload_validation
+                    st.session_state.auto_upload_validation = upload_validation
 
                     if has_validation_errors(upload_validation):
                         st.error("Shopify upload blocked by listing safety errors.")
