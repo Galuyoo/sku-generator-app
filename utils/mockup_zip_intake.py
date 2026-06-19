@@ -687,3 +687,199 @@ def replace_pipeline_design_mockups(
 
     return report
 
+def _ensure_dropbox_folder(dbx, folder_path: str) -> None:
+    folder_path = "/" + folder_path.strip("/")
+    if folder_path == "/":
+        return
+
+    current = ""
+    for part in [p for p in folder_path.strip("/").split("/") if p]:
+        current = f"{current}/{part}"
+        try:
+            dbx.files_create_folder_v2(current)
+        except Exception as exc:
+            message = str(exc).lower()
+            if "conflict" in message or "folder" in message and "already" in message:
+                continue
+            try:
+                dbx.files_get_metadata(current)
+            except Exception:
+                raise exc
+
+
+def _dropbox_direct_url(url: str) -> str:
+    if not url:
+        return url
+
+    if "dl=0" in url:
+        return url.replace("dl=0", "raw=1")
+
+    if "dl=1" in url:
+        return url.replace("dl=1", "raw=1")
+
+    if "raw=1" in url:
+        return url
+
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}raw=1"
+
+
+def _get_or_create_dropbox_shared_link(dbx, path: str) -> str:
+    try:
+        links = dbx.sharing_list_shared_links(path=path, direct_only=True).links
+        if links:
+            return _dropbox_direct_url(links[0].url)
+    except Exception:
+        pass
+
+    try:
+        link = dbx.sharing_create_shared_link_with_settings(path)
+        return _dropbox_direct_url(link.url)
+    except Exception:
+        links = dbx.sharing_list_shared_links(path=path, direct_only=True).links
+        if links:
+            return _dropbox_direct_url(links[0].url)
+        raise
+
+
+def upload_ready_design_to_dropbox_temp(
+    dbx,
+    sku: str,
+    pipeline_root="pipeline_data",
+    dropbox_root="/sku-generator-temp/active",
+    expected_count=80,
+    overwrite=True,
+) -> dict:
+    import shutil
+    from pathlib import Path
+
+    report = {
+        "ready": False,
+        "status": "ready",
+        "sku": sku,
+        "design_folder": None,
+        "dropbox_folder": None,
+        "image_links_path": None,
+        "uploaded": 0,
+        "linked": 0,
+        "skipped": 0,
+        "failed": 0,
+        "issues": [],
+        "warnings": [],
+        "image_links": {},
+    }
+
+    sku = str(sku or "").strip()
+    if not sku:
+        report["issues"].append("Select a ready design first.")
+        return report
+
+    pipeline_root = Path(pipeline_root)
+    ready_folder = pipeline_root / "ready" / sku
+    active_folder = pipeline_root / "active" / sku
+
+    if not ready_folder.exists():
+        report["issues"].append(f"Ready design folder not found: {ready_folder}")
+        return report
+
+    validation = _validate_design_folder(ready_folder, expected_count=expected_count)
+    if not validation["ready"]:
+        report["issues"].extend(validation["issues"])
+        return report
+
+    mockups_folder = ready_folder / "mockups"
+    image_files = [
+        path for path in mockups_folder.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+    image_files = sorted(image_files, key=lambda path: natural_sort_key(path.name))
+
+    dropbox_folder = "/" + f"{dropbox_root.strip('/')}/{sku}".strip("/")
+    report["dropbox_folder"] = dropbox_folder
+
+    try:
+        _ensure_dropbox_folder(dbx, dropbox_folder)
+    except Exception as exc:
+        report["issues"].append(f"Could not create Dropbox folder {dropbox_folder}: {exc}")
+        return report
+
+    uploaded = 0
+    skipped = 0
+    failed = 0
+    image_links = {}
+
+    for image_path in image_files[:expected_count]:
+        stem = image_path.stem
+        if not stem.isdigit():
+            report["warnings"].append(f"Skipped non-numbered image: {image_path.name}")
+            skipped += 1
+            continue
+
+        image_number = int(stem)
+        dropbox_path = f"{dropbox_folder}/{image_path.name}"
+
+        try:
+            content = image_path.read_bytes()
+            mode = dropbox.files.WriteMode.overwrite if overwrite else dropbox.files.WriteMode.add
+            dbx.files_upload(content, dropbox_path, mode=mode, mute=True)
+            uploaded += 1
+
+            image_links[str(image_number)] = _get_or_create_dropbox_shared_link(dbx, dropbox_path)
+        except Exception as exc:
+            failed += 1
+            report["issues"].append(f"Failed {image_path.name}: {exc}")
+
+    if failed:
+        status = "ready"
+        design_folder = ready_folder
+    else:
+        if active_folder.exists():
+            if overwrite:
+                shutil.rmtree(active_folder)
+            else:
+                report["issues"].append(f"Active folder already exists: {active_folder}")
+                return report
+
+        shutil.move(str(ready_folder), str(active_folder))
+        design_folder = active_folder
+        status = "active"
+
+    image_links_path = design_folder / "image_links.json"
+    _write_json_file(image_links_path, image_links)
+
+    manifest_path = design_folder / "manifest.json"
+    manifest = {}
+    if manifest_path.exists():
+        try:
+            manifest = _read_json_file(manifest_path)
+        except Exception:
+            manifest = {}
+
+    manifest.update({
+        "sku": sku,
+        "status": status,
+        "dropbox_folder": dropbox_folder,
+        "image_links_path": str(image_links_path),
+        "dropbox_uploaded": failed == 0,
+        "uploaded_image_count": uploaded,
+        "linked_image_count": len(image_links),
+        "issues": report["issues"],
+        "warnings": report["warnings"],
+        "updated_at": _pipeline_now_iso(),
+    })
+    _write_manifest(design_folder, manifest)
+
+    report.update({
+        "ready": failed == 0,
+        "status": status,
+        "design_folder": str(design_folder),
+        "image_links_path": str(image_links_path),
+        "uploaded": uploaded,
+        "linked": len(image_links),
+        "skipped": skipped,
+        "failed": failed,
+        "image_links": image_links,
+    })
+
+    return report
+

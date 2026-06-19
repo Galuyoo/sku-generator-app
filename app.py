@@ -23,6 +23,7 @@ from utils.listing_validation import (
     validate_shopify_dataframe,
 )
 from utils.mockup_zip_intake import (
+    upload_ready_design_to_dropbox_temp,
     replace_pipeline_design_mockups,
     attach_metadata_to_pipeline_design,
     digest_mockup_zip_to_pipeline,
@@ -1274,6 +1275,90 @@ with tab_pipeline:
         st.dataframe(pd.DataFrame(ready_rows), width="stretch")
     else:
         st.info("No ready designs yet.")
+
+    st.markdown("#### Host ready design images on Dropbox")
+
+    if ready_rows:
+        ready_skus = [row["SKU"] for row in ready_rows]
+        selected_ready_sku = st.selectbox(
+            "Select ready design",
+            ready_skus,
+            key="pipeline_dropbox_ready_sku",
+        )
+
+        dropbox_temp_root = st.text_input(
+            "Dropbox temp root folder",
+            value="/sku-generator-temp/active",
+            key="pipeline_dropbox_temp_root",
+            help="The app will create this folder automatically if it does not exist.",
+        )
+
+        overwrite_dropbox_temp = st.checkbox(
+            "Overwrite existing Dropbox temp files",
+            value=True,
+            key="pipeline_dropbox_overwrite",
+        )
+
+        if st.button("Upload Images to Dropbox Temp Hosting", key="pipeline_upload_dropbox_temp_btn"):
+            try:
+                dbx = get_dropbox_client()
+            except Exception as exc:
+                st.error(f"Could not connect to Dropbox: {exc}")
+            else:
+                with st.status("Uploading ready design images to Dropbox...", expanded=True) as s:
+                    upload_report = upload_ready_design_to_dropbox_temp(
+                        dbx,
+                        selected_ready_sku,
+                        pipeline_root=pipeline_root,
+                        dropbox_root=dropbox_temp_root,
+                        expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                        overwrite=overwrite_dropbox_temp,
+                    )
+
+                    s.write(f"Dropbox folder: {upload_report.get('dropbox_folder')}")
+                    s.write(f"Uploaded: {upload_report.get('uploaded', 0)}")
+                    s.write(f"Linked: {upload_report.get('linked', 0)}")
+                    s.write(f"Failed: {upload_report.get('failed', 0)}")
+
+                    if upload_report.get("ready"):
+                        s.update(label="Dropbox temp hosting complete.")
+                        st.success("Images uploaded and linked. Design moved to active.")
+                    else:
+                        s.update(label="Dropbox temp hosting completed with issues.")
+                        st.warning("Dropbox hosting did not fully complete.")
+
+                col1, col2, col3 = st.columns(3)
+                col1.metric("SKU", upload_report.get("sku") or "Missing")
+                col2.metric("Uploaded", upload_report.get("uploaded", 0))
+                col3.metric("Linked", upload_report.get("linked", 0))
+
+                st.write("Design folder:", upload_report.get("design_folder"))
+                st.write("Dropbox folder:", upload_report.get("dropbox_folder"))
+                st.write("Image links path:", upload_report.get("image_links_path"))
+
+                issues = upload_report.get("issues", [])
+                warnings = upload_report.get("warnings", [])
+
+                if issues:
+                    st.error("Issues")
+                    for issue in issues:
+                        st.write(f"- {issue}")
+
+                if warnings:
+                    st.warning("Warnings")
+                    for warning in warnings:
+                        st.write(f"- {warning}")
+
+                image_links = upload_report.get("image_links", {})
+                if image_links:
+                    st.write("First image links")
+                    sample_lines = [
+                        f"{key}: {value}"
+                        for key, value in list(image_links.items())[:5]
+                    ]
+                    st.code("\n".join(sample_lines))
+    else:
+        st.info("No ready designs available for Dropbox temp hosting.")
 
 
 # =========================
