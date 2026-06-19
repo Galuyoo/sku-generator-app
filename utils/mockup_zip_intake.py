@@ -465,3 +465,225 @@ def scan_pipeline_folders(pipeline_root="pipeline_data", expected_count=80) -> d
 
     return result
 
+def attach_metadata_to_pipeline_design(
+    sku: str,
+    uploaded_json,
+    pipeline_root="pipeline_data",
+    expected_count=80,
+    overwrite=True,
+) -> dict:
+    import shutil
+    from pathlib import Path
+
+    report = {
+        "ready": False,
+        "status": "staged",
+        "sku": sku,
+        "design_folder": None,
+        "metadata_path": None,
+        "mockups_folder": None,
+        "image_count": 0,
+        "issues": [],
+        "warnings": [],
+    }
+
+    sku = str(sku or "").strip()
+    if not sku:
+        report["issues"].append("Select a staged design first.")
+        return report
+
+    pipeline_root = Path(pipeline_root)
+    staged_folder = pipeline_root / "staged" / sku
+    ready_folder = pipeline_root / "ready" / sku
+
+    if not staged_folder.exists():
+        report["issues"].append(f"Staged design folder not found: {staged_folder}")
+        return report
+
+    try:
+        metadata = load_metadata_json(uploaded_json)
+    except Exception as exc:
+        report["issues"].append(f"Could not read metadata JSON: {exc}")
+        return report
+
+    metadata_issues = validate_pipeline_metadata(metadata)
+    json_sku = str(metadata.get("sku_suffix", "")).strip()
+
+    if json_sku and json_sku != sku:
+        metadata_issues.append(f"Selected SKU '{sku}' does not match JSON sku_suffix '{json_sku}'.")
+
+    metadata_path = staged_folder / "metadata.json"
+    if metadata_path.exists() and not overwrite:
+        report["issues"].append("metadata.json already exists. Enable overwrite to replace it.")
+        return report
+
+    _write_json_file(metadata_path, metadata)
+
+    validation = _validate_design_folder(staged_folder, expected_count=expected_count)
+    issues = metadata_issues + validation["issues"]
+    warnings = validation["warnings"]
+
+    status = "ready" if not issues else "staged"
+    design_folder = staged_folder
+
+    if status == "ready":
+        if ready_folder.exists():
+            if overwrite:
+                shutil.rmtree(ready_folder)
+            else:
+                report["issues"].append(f"Ready folder already exists: {ready_folder}")
+                return report
+
+        shutil.move(str(staged_folder), str(ready_folder))
+        design_folder = ready_folder
+
+    manifest = {
+        "sku": sku,
+        "status": status,
+        "source_zip_name": None,
+        "image_count": validation["image_count"],
+        "has_metadata": True,
+        "issues": issues,
+        "warnings": warnings,
+        "created_at": _pipeline_now_iso(),
+        "updated_at": _pipeline_now_iso(),
+    }
+    _write_manifest(design_folder, manifest)
+
+    report.update({
+        "ready": status == "ready",
+        "status": status,
+        "design_folder": str(design_folder),
+        "metadata_path": str(design_folder / "metadata.json"),
+        "mockups_folder": str(design_folder / "mockups"),
+        "image_count": validation["image_count"],
+        "issues": issues,
+        "warnings": warnings,
+    })
+
+    return report
+
+def replace_pipeline_design_mockups(
+    sku: str,
+    uploaded_zip,
+    pipeline_root="pipeline_data",
+    expected_count=80,
+    overwrite=True,
+) -> dict:
+    import shutil
+    from pathlib import Path
+
+    report = {
+        "ready": False,
+        "status": "staged",
+        "sku": sku,
+        "design_folder": None,
+        "metadata_path": None,
+        "mockups_folder": None,
+        "image_count": 0,
+        "issues": [],
+        "warnings": [],
+        "image_files": [],
+    }
+
+    sku = str(sku or "").strip()
+    if not sku:
+        report["issues"].append("Select a staged design first.")
+        return report
+
+    pipeline_root = Path(pipeline_root)
+    staged_folder = pipeline_root / "staged" / sku
+    ready_folder = pipeline_root / "ready" / sku
+
+    if staged_folder.exists():
+        design_folder = staged_folder
+    elif ready_folder.exists():
+        design_folder = ready_folder
+        report["status"] = "ready"
+    else:
+        report["issues"].append(f"Design folder not found for SKU: {sku}")
+        return report
+
+    mockups_folder = design_folder / "mockups"
+
+    if mockups_folder.exists():
+        if overwrite:
+            shutil.rmtree(mockups_folder)
+        else:
+            report["issues"].append("mockups folder already exists. Enable overwrite to replace it.")
+            return report
+
+    mockups_folder.mkdir(parents=True, exist_ok=True)
+
+    try:
+        images = extract_mockup_images(uploaded_zip)
+    except zipfile.BadZipFile:
+        report["issues"].append("ZIP file could not be read.")
+        return report
+    except Exception as exc:
+        report["issues"].append(f"Could not extract ZIP: {exc}")
+        return report
+
+    if not images:
+        report["issues"].append("No supported image files found in ZIP.")
+
+    copied_files = []
+    for index, (source_name, content, ext) in enumerate(images[:expected_count], start=1):
+        target_path = mockups_folder / f"{index}{ext.lower()}"
+        target_path.write_bytes(content)
+        copied_files.append(str(target_path))
+
+    if len(images) > expected_count:
+        report["warnings"].append(f"Found {len(images)} images; only the first {expected_count} were staged.")
+
+    validation = _validate_design_folder(design_folder, expected_count=expected_count)
+    issues = report["issues"] + validation["issues"]
+    warnings = report["warnings"] + validation["warnings"]
+
+    status = "ready" if not issues else "staged"
+
+    if design_folder == ready_folder and status == "staged":
+        if staged_folder.exists():
+            shutil.rmtree(staged_folder)
+        shutil.move(str(ready_folder), str(staged_folder))
+        design_folder = staged_folder
+        mockups_folder = design_folder / "mockups"
+
+    elif design_folder == staged_folder and status == "ready":
+        if ready_folder.exists():
+            if overwrite:
+                shutil.rmtree(ready_folder)
+            else:
+                report["issues"].append(f"Ready folder already exists: {ready_folder}")
+                return report
+        shutil.move(str(staged_folder), str(ready_folder))
+        design_folder = ready_folder
+        mockups_folder = design_folder / "mockups"
+
+    manifest = {
+        "sku": sku,
+        "status": status,
+        "source_zip_name": getattr(uploaded_zip, "name", None),
+        "image_count": len(copied_files),
+        "has_metadata": (design_folder / "metadata.json").exists(),
+        "issues": issues,
+        "warnings": warnings,
+        "created_at": _pipeline_now_iso(),
+        "updated_at": _pipeline_now_iso(),
+    }
+    _write_manifest(design_folder, manifest)
+
+    report.update({
+        "ready": status == "ready",
+        "status": status,
+        "design_folder": str(design_folder),
+        "metadata_path": str(design_folder / "metadata.json") if (design_folder / "metadata.json").exists() else None,
+        "mockups_folder": str(mockups_folder),
+        "image_count": len(copied_files),
+        "issues": issues,
+        "warnings": warnings,
+        "image_files": copied_files,
+    })
+
+    return report
+

@@ -23,6 +23,8 @@ from utils.listing_validation import (
     validate_shopify_dataframe,
 )
 from utils.mockup_zip_intake import (
+    replace_pipeline_design_mockups,
+    attach_metadata_to_pipeline_design,
     digest_mockup_zip_to_pipeline,
     extract_mockup_images,
     inspect_mockup_zip,
@@ -1137,6 +1139,135 @@ with tab_pipeline:
         st.dataframe(pd.DataFrame(staged_rows), width="stretch")
     else:
         st.info("No staged designs yet.")
+
+    st.markdown("#### Add metadata to staged design")
+
+    if staged_rows:
+        staged_skus = [row["SKU"] for row in staged_rows]
+        selected_staged_sku = st.selectbox(
+            "Select staged design",
+            staged_skus,
+            key="pipeline_attach_json_sku",
+        )
+
+        uploaded_late_json = st.file_uploader(
+            "Metadata JSON for selected staged design",
+            type=["json"],
+            key="pipeline_attach_metadata_json",
+        )
+
+        overwrite_late_metadata = st.checkbox(
+            "Overwrite metadata if it already exists",
+            value=True,
+            key="pipeline_attach_overwrite_metadata",
+        )
+
+        if st.button("Attach JSON and Revalidate", key="pipeline_attach_json_btn"):
+            if uploaded_late_json is None:
+                st.error("Upload a metadata JSON first.")
+            else:
+                attach_report = attach_metadata_to_pipeline_design(
+                    selected_staged_sku,
+                    uploaded_late_json,
+                    pipeline_root=pipeline_root,
+                    expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                    overwrite=overwrite_late_metadata,
+                )
+
+                if attach_report.get("ready"):
+                    st.success("Metadata attached. Design moved to ready.")
+                else:
+                    st.warning("Metadata attached, but design is still not ready.")
+
+                col1, col2, col3 = st.columns(3)
+                col1.metric("SKU", attach_report.get("sku") or "Missing")
+                col2.metric("Images", attach_report.get("image_count", 0))
+                col3.metric("Status", attach_report.get("status", "unknown"))
+
+                st.write("Design folder:", attach_report.get("design_folder"))
+                st.write("Metadata path:", attach_report.get("metadata_path"))
+
+                issues = attach_report.get("issues", [])
+                warnings = attach_report.get("warnings", [])
+
+                if issues:
+                    st.error("Issues")
+                    for issue in issues:
+                        st.write(f"- {issue}")
+
+                if warnings:
+                    st.warning("Warnings")
+                    for warning in warnings:
+                        st.write(f"- {warning}")
+    else:
+        st.info("No staged designs available for metadata attachment.")
+
+    st.markdown("#### Replace mockups for staged design")
+
+    if staged_rows:
+        staged_skus_for_mockups = [row["SKU"] for row in staged_rows]
+        selected_mockup_replace_sku = st.selectbox(
+            "Select staged design to replace mockups",
+            staged_skus_for_mockups,
+            key="pipeline_replace_mockups_sku",
+        )
+
+        uploaded_replacement_zip = st.file_uploader(
+            "Replacement mockup ZIP",
+            type=["zip"],
+            key="pipeline_replacement_mockup_zip",
+        )
+
+        overwrite_replacement_mockups = st.checkbox(
+            "Overwrite existing mockups",
+            value=True,
+            key="pipeline_replace_mockups_overwrite",
+        )
+
+        if st.button("Replace Mockups and Revalidate", key="pipeline_replace_mockups_btn"):
+            if uploaded_replacement_zip is None:
+                st.error("Upload a replacement mockup ZIP first.")
+            else:
+                replace_report = replace_pipeline_design_mockups(
+                    selected_mockup_replace_sku,
+                    uploaded_replacement_zip,
+                    pipeline_root=pipeline_root,
+                    expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                    overwrite=overwrite_replacement_mockups,
+                )
+
+                if replace_report.get("ready"):
+                    st.success("Mockups replaced. Design moved to ready.")
+                else:
+                    st.warning("Mockups replaced, but design is still not ready.")
+
+                col1, col2, col3 = st.columns(3)
+                col1.metric("SKU", replace_report.get("sku") or "Missing")
+                col2.metric("Images", replace_report.get("image_count", 0))
+                col3.metric("Status", replace_report.get("status", "unknown"))
+
+                st.write("Design folder:", replace_report.get("design_folder"))
+                st.write("Mockups folder:", replace_report.get("mockups_folder"))
+
+                issues = replace_report.get("issues", [])
+                warnings = replace_report.get("warnings", [])
+
+                if issues:
+                    st.error("Issues")
+                    for issue in issues:
+                        st.write(f"- {issue}")
+
+                if warnings:
+                    st.warning("Warnings")
+                    for warning in warnings:
+                        st.write(f"- {warning}")
+
+                image_files = replace_report.get("image_files", [])
+                if image_files:
+                    st.write("First mapped images")
+                    st.code("\n".join(image_files[:10]))
+    else:
+        st.info("No staged designs available for mockup replacement.")
 
     st.markdown("#### Ready designs")
     if ready_rows:
