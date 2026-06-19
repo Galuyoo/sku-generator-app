@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import time
 import requests
 import re
+from pathlib import Path
 # --- your existing imports (unchanged) ---
 from utils import shopify_utils
 from utils.canva_utils import load_canva_image_links_by_sku
@@ -715,6 +716,75 @@ excluded_colors = st.multiselect(
 )
 
 
+
+def _load_pipeline_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _build_pipeline_csv_for_active_design(design_folder: str, excluded_colors=None):
+    design_path = Path(design_folder)
+    metadata_path = design_path / "metadata.json"
+    image_links_path = design_path / "image_links.json"
+
+    if not metadata_path.exists():
+        raise RuntimeError(f"Missing metadata JSON: {metadata_path}")
+
+    if not image_links_path.exists():
+        raise RuntimeError(f"Missing image_links.json: {image_links_path}")
+
+    metadata = _load_pipeline_json(metadata_path)
+    image_links_raw = _load_pipeline_json(image_links_path)
+
+    image_links = {
+        int(key): value
+        for key, value in image_links_raw.items()
+        if str(key).isdigit() and value
+    }
+
+    tags_csv = ", ".join(
+        str(tag).strip()
+        for tag in metadata.get("tags", [])
+        if str(tag).strip()
+    )
+
+    df = generate_sku_dataframe(
+        product_name=metadata.get("product_name", ""),
+        sku_suffix=metadata.get("sku_suffix", ""),
+        main_color=metadata.get("main_color", ""),
+        tags=tags_csv,
+        garment_keys=garment_keys,
+        raw_descriptions=metadata.get("descriptions", []),
+        body_html_map=body_html_map,
+        product_extras=product_extras,
+        product_types=product_types,
+        correct_colors_by_type=correct_colors_by_type,
+        vendor=vendor,
+        published=published,
+        inventory_policy=inventory_policy,
+        fulfillment_service=fulfillment_service,
+        requires_shipping=requires_shipping,
+        taxable=taxable,
+        inventory_tracker=inventory_tracker,
+        image_links=image_links,
+        excluded_colors=excluded_colors or [],
+        page_titles=metadata.get("page_titles", []),
+    )
+
+    sku = str(metadata.get("sku_suffix", design_path.name)).strip() or design_path.name
+    csv_path = design_path / f"{sku}.csv"
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    return {
+        "sku": sku,
+        "csv_path": str(csv_path),
+        "rows": len(df),
+        "columns": list(df.columns),
+        "df": df,
+    }
+
+
+
 # ---------- Tabs ----------
 tab_manual, tab_pipeline, tab_auto = st.tabs(["Manual listing builder", "Pipeline Intake", "Auto from Dropbox"])
 
@@ -1359,6 +1429,59 @@ with tab_pipeline:
                     st.code("\n".join(sample_lines))
     else:
         st.info("No ready designs available for Dropbox temp hosting.")
+
+
+    st.divider()
+
+    render_section_header("Active designs")
+
+    pipeline_scan_after_hosting = scan_pipeline_folders(
+        pipeline_root=pipeline_root,
+        expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+    )
+    active_rows = pipeline_scan_after_hosting.get("active", [])
+
+    if active_rows:
+        st.dataframe(pd.DataFrame(active_rows), width="stretch")
+
+        active_skus = [row["SKU"] for row in active_rows]
+        selected_active_sku = st.selectbox(
+            "Select active design for CSV generation",
+            active_skus,
+            key="pipeline_csv_active_sku",
+        )
+
+        active_folder_by_sku = {
+            row["SKU"]: row["Folder"]
+            for row in active_rows
+        }
+
+        if st.button("Generate CSV from Active Design", key="pipeline_generate_csv_btn"):
+            try:
+                csv_result = _build_pipeline_csv_for_active_design(
+                    active_folder_by_sku[selected_active_sku],
+                    excluded_colors=excluded_colors,
+                )
+            except Exception as exc:
+                st.error(f"Could not generate CSV: {exc}")
+            else:
+                st.success("CSV generated successfully.")
+                st.metric("Rows", csv_result["rows"])
+                st.write("CSV path:", csv_result["csv_path"])
+
+                csv_bytes = csv_result["df"].to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "Download Shopify CSV",
+                    data=csv_bytes,
+                    file_name=f"{csv_result['sku']}.csv",
+                    mime="text/csv",
+                    key="pipeline_download_generated_csv_btn",
+                )
+
+                with st.expander("Preview generated rows", expanded=False):
+                    st.dataframe(csv_result["df"].head(20), width="stretch")
+    else:
+        st.info("No active designs yet. Upload a ready design to Dropbox temp hosting first.")
 
 
 # =========================
