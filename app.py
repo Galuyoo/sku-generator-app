@@ -23,8 +23,10 @@ from utils.listing_validation import (
     validate_shopify_dataframe,
 )
 from utils.mockup_zip_intake import (
+    digest_mockup_zip_to_pipeline,
     extract_mockup_images,
     inspect_mockup_zip,
+    scan_pipeline_folders,
     upload_mockup_images_to_dropbox,
 )
 from utils.dropbox_utils import (
@@ -711,7 +713,7 @@ excluded_colors = st.multiselect(
 
 
 # ---------- Tabs ----------
-tab_manual, tab_auto = st.tabs(["Manual listing builder", "🤖 Auto from Dropbox"])
+tab_manual, tab_pipeline, tab_auto = st.tabs(["Manual listing builder", "Pipeline Intake", "Auto from Dropbox"])
 
 # =========================
 # Tab 1: Manual listing builder
@@ -1032,6 +1034,116 @@ def clean_and_archive_to_completed(dbx: dropbox.Dropbox, folder: str) -> tuple[i
     dest = f"{COMPLETED_ROOT}/{folder}"
     dbx.files_move_v2(finished_path, dest, autorename=True)
     return deleted, dest
+
+
+# =========================
+# Tab 2: Pipeline Intake
+# =========================
+with tab_pipeline:
+    render_section_header(
+        "Pipeline Intake",
+        "Digest Canva mockup ZIPs into local staged or ready folders.",
+    )
+
+    pipeline_root = st.text_input(
+        "Pipeline root folder",
+        value="pipeline_data",
+        key="pipeline_root",
+        help="Local folder where staged, ready, active, and finished designs are stored.",
+    )
+
+    uploaded_pipeline_zip = st.file_uploader(
+        "Mockup ZIP",
+        type=["zip"],
+        key="pipeline_mockup_zip",
+        help="Upload one Canva mockup ZIP for one design/SKU.",
+    )
+
+    uploaded_pipeline_json = st.file_uploader(
+        "Metadata JSON optional",
+        type=["json"],
+        key="pipeline_metadata_json",
+        help="Upload metadata JSON now, or leave empty and add it later.",
+    )
+
+    overwrite_pipeline_design = st.checkbox(
+        "Overwrite existing design folder",
+        value=True,
+        key="pipeline_overwrite_design",
+    )
+
+    if st.button("Digest ZIP", key="pipeline_digest_zip_btn"):
+        if uploaded_pipeline_zip is None:
+            st.error("Upload a mockup ZIP first.")
+        else:
+            report = digest_mockup_zip_to_pipeline(
+                uploaded_pipeline_zip,
+                uploaded_json=uploaded_pipeline_json,
+                pipeline_root=pipeline_root,
+                expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                overwrite=overwrite_pipeline_design,
+            )
+
+            if report.get("ready"):
+                st.success("Design is ready.")
+            else:
+                st.warning("Design staged but not ready.")
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("SKU", report.get("sku") or "Missing")
+            col2.metric("Images", report.get("image_count", 0))
+            col3.metric("Status", report.get("status", "unknown"))
+
+            st.write("Design folder:", report.get("design_folder"))
+            st.write("Mockups folder:", report.get("mockups_folder"))
+            st.write("Metadata path:", report.get("metadata_path"))
+
+            issues = report.get("issues", [])
+            warnings = report.get("warnings", [])
+
+            if issues:
+                st.error("Issues")
+                for issue in issues:
+                    st.write(f"- {issue}")
+
+            if warnings:
+                st.warning("Warnings")
+                for warning in warnings:
+                    st.write(f"- {warning}")
+
+            image_files = report.get("image_files", [])
+            if image_files:
+                st.write("First mapped images")
+                st.code("\n".join(image_files[:10]))
+
+    st.divider()
+
+    render_section_header("Pipeline folders")
+
+    pipeline_scan = scan_pipeline_folders(
+        pipeline_root=pipeline_root,
+        expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+    )
+
+    staged_rows = pipeline_scan.get("staged", [])
+    ready_rows = pipeline_scan.get("ready", [])
+
+    col_staged, col_ready = st.columns(2)
+    col_staged.metric("Staged", len(staged_rows))
+    col_ready.metric("Ready", len(ready_rows))
+
+    st.markdown("#### Staged designs")
+    if staged_rows:
+        st.dataframe(pd.DataFrame(staged_rows), width="stretch")
+    else:
+        st.info("No staged designs yet.")
+
+    st.markdown("#### Ready designs")
+    if ready_rows:
+        st.dataframe(pd.DataFrame(ready_rows), width="stretch")
+    else:
+        st.info("No ready designs yet.")
+
 
 # =========================
 # Tab 2: Auto from Dropbox

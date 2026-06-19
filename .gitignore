@@ -44,3 +44,7 @@ reports/
 .logo.png
 
 config.json
+
+pipeline_data/
+.agents/
+skills-lock.json
