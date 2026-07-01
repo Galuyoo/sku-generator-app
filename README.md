@@ -15,6 +15,7 @@ It supports:
 
 -   Manual product creation via UI inputs
 -   Automated CSV generation from structured Dropbox design folders
+-   Live mockup intake for Canva ZIPs plus matching metadata JSON uploads
 -   Config-driven garment / size / color mapping
 -   Image-to-variant mapping using predefined mockup rules
 -   Google Sheets SKU suffix tracking (duplicate protection)
@@ -77,11 +78,15 @@ See `.env.example` for full list.
 Typical variables:
 
 -   `DROPBOX_REFRESH_TOKEN`
+-   `FOLDER_PATH_Design`
 -   `SHOPIFY_STORE_URL_TEST`
 -   `SHOPIFY_API_PASSWORD_TEST`
 -   `SHOPIFY_STORE_URL_PROD`
 -   `SHOPIFY_API_PASSWORD_PROD`
 -   `GOOGLE_KEYFILE`
+-   `SKU_APP_LIVE_DEPLOYMENT=1` to show only the deployable Auto from
+    Dropbox workflow. Set it to `0` locally to show the older development
+    tabs.
 
 ------------------------------------------------------------------------
 

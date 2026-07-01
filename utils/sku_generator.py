@@ -11,6 +11,7 @@ def generate_sku_dataframe(
     vendor, published, inventory_policy, fulfillment_service, requires_shipping, taxable, inventory_tracker,
     image_links=None,
     excluded_colors: list[str] = None,
+    excluded_garments: list[str] = None,
     page_titles: list[str] = None,
 ):
     def generate_alt_text(title):
@@ -20,6 +21,10 @@ def generate_sku_dataframe(
 
     if excluded_colors is None:
         excluded_colors = []
+    if excluded_garments is None:
+        excluded_garments = []
+
+    excluded_garment_names = {str(g).strip().lower() for g in excluded_garments if str(g).strip()}
 
     if isinstance(raw_descriptions, list):
         desc_list = [d.strip() for d in raw_descriptions if d.strip()]
@@ -46,6 +51,9 @@ def generate_sku_dataframe(
     rows = []
     for garment_type, config in product_types.items():
         base_type = garment_type  # original, unmapped
+        if base_type.lower() in excluded_garment_names:
+            continue
+
         shopify_type = adult_map.get(base_type, base_type)  # ONLY for Shopify "Type" column
 
         sizes = config["sizes"]
@@ -97,8 +105,8 @@ def generate_sku_dataframe(
 
             sku_prefix_map = {
                 "T Shirt": "UC301", "Hoodie": "JH001", "Sweatshirt": "JH030",
-                "Ladies T-Shirt": "5000L", "Tank-Top": "GD012", "Longsleeve T-Shirt": "ST01",
-                "Oversized T-Shirt": "BY102", "Kids T-Shirt": "T06", "Kids Hoodie": "JH01J",
+                "Ladies T-Shirt": "GD006", "Tank-Top": "GD012", "Longsleeve T-Shirt": "UC314",
+                "Oversized T-Shirt": "BY102", "Kids T-Shirt": "UC306", "Kids Hoodie": "JH01J",
                 "Kids Sweatshirt": "JH30J", "Ringer T-Shirt": "SS168", "Raglan T-Shirt": "SS026",
             }
             sku = f"{sku_prefix_map.get(base_type, 'SKU')}-{size}-{color.replace(' ', '')}-{sku_suffix}"

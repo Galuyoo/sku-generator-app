@@ -24,6 +24,7 @@ from utils.listing_validation import (
     validate_shopify_dataframe,
 )
 from utils.mockup_zip_intake import (
+    load_metadata_json,
     upload_ready_design_to_dropbox_temp,
     replace_pipeline_design_mockups,
     attach_metadata_to_pipeline_design,
@@ -32,6 +33,7 @@ from utils.mockup_zip_intake import (
     inspect_mockup_zip,
     scan_pipeline_folders,
     upload_mockup_images_to_dropbox,
+    validate_image_bytes,
 )
 from utils.dropbox_utils import (
     get_dropbox_client,
@@ -48,6 +50,7 @@ def analyze_design_folders(
     dbx: dropbox.Dropbox,
     root: str,
     mockup_source: str = "Dropbox",
+    validate_dropbox_images: bool = False,
 ):
     ready, not_ready = [], []
 
@@ -73,10 +76,7 @@ def analyze_design_folders(
             json_files = [fn for fn in files if fn.lower().endswith(".json")]
             has_meta = bool(json_files)
             has_txt = any(fn.lower().endswith((".txt", ".pdf")) for fn in files)
-            has_art = any(
-                fn.split(".")[0] == name and fn.lower().split(".")[-1] in {"png", "jpg", "jpeg", "webp"}
-                for fn in files
-            )
+            has_art = any(_is_design_art_filename(fn) for fn in files)
 
             sku_suffix = ""
             descriptions_count_label = "N/A"
@@ -106,20 +106,35 @@ def analyze_design_folders(
                     if fn.lower().endswith((".png", ".jpg", ".jpeg", ".webp")) and fn.split(".")[0].isdigit()
                 ]
                 numbered_count = len(numbered_images)
-                image_count_label = f"{numbered_count} / 80"
+                image_count_label = f"{numbered_count} / {MOCKUP_ZIP_EXPECTED_IMAGES}"
 
-                if numbered_count < 80:
-                    errors.append(f"Only {numbered_count}/80 images")
+                if numbered_count < MOCKUP_ZIP_EXPECTED_IMAGES:
+                    errors.append(f"Only {numbered_count}/{MOCKUP_ZIP_EXPECTED_IMAGES} images")
+                elif validate_dropbox_images:
+                    invalid_images = _invalid_dropbox_numbered_images(
+                        dbx,
+                        path,
+                        MOCKUP_ZIP_EXPECTED_IMAGES,
+                    )
+                    if invalid_images:
+                        invalid_labels = ", ".join(
+                            f"{item['target']} ({item['error']})"
+                            for item in invalid_images[:5]
+                        )
+                        remaining = len(invalid_images) - 5
+                        if remaining > 0:
+                            invalid_labels = f"{invalid_labels}; +{remaining} more"
+                        errors.append(f"Invalid images: {invalid_labels}")
 
             if errors:
                 not_ready.append({
                     "Folder": name,
-                    "Has .json": "✅" if has_meta else "❌",
-                    "Has notes": "✅" if has_txt else "❌",
-                    "Has art": "✅" if has_art else "❌",
+                    "Has .json": "✅" if has_meta else "",
+                    "Has notes": "✅" if has_txt else "",
+                    "Has art": "✅" if has_art else "",
                     "Image count": image_count_label,
                     "Descriptions": descriptions_count_label,
-                    "SKU in json": "✅" if sku_suffix else "❌",
+                    "SKU in json": "✅" if sku_suffix else "",
                     "Issues": ", ".join(errors),
                 })
             else:
@@ -128,16 +143,54 @@ def analyze_design_folders(
         except Exception as e:
             not_ready.append({
                 "Folder": name,
-                "Has .json": "❌",
-                "Has notes": "❌",
-                "Has art": "❌",
+                "Has .json": "",
+                "Has notes": "",
+                "Has art": "",
                 "Image count": "N/A" if mockup_source == "Canva" else "0 / 80",
                 "Descriptions": "N/A",
-                "SKU in json": "❌",
+                "SKU in json": "",
                 "Issues": f"Error: {e}",
             })
 
     return ready, not_ready
+
+
+def _invalid_dropbox_numbered_images(
+    dbx: dropbox.Dropbox,
+    folder_path: str,
+    expected_count: int,
+) -> list[dict]:
+    try:
+        entries = _list_dropbox_folder_entries(dbx, folder_path)
+    except Exception as exc:
+        return [{"target": "N/A", "error": f"Could not list folder: {exc}"}]
+
+    numbered_files = []
+    for entry in entries:
+        if not isinstance(entry, dropbox.files.FileMetadata):
+            continue
+
+        stem, ext = os.path.splitext(entry.name.lower())
+        if stem.isdigit() and ext in {".png", ".jpg", ".jpeg", ".webp"}:
+            number = int(stem)
+            if 1 <= number <= expected_count:
+                numbered_files.append((number, entry.name))
+
+    invalid = []
+    for number, filename in sorted(numbered_files):
+        path = f"{folder_path.rstrip('/')}/{filename}"
+        try:
+            _, response = dbx.files_download(path)
+            ok, error = validate_image_bytes(response.content)
+        except Exception as exc:
+            ok = False
+            error = str(exc)
+
+        if not ok:
+            invalid.append({"number": number, "target": filename, "error": error})
+
+    return invalid
+
 
 def download_metadata(dbx: dropbox.Dropbox, folder_path: str) -> dict:
     try:
@@ -215,7 +268,7 @@ def _render_downloads(key: str, title: str, zip_name_prefix: str = "FILES"):
     zip_buf.seek(0)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     st.download_button(
-        label="⬇️ Download ALL as ZIP",
+        label="⬇ Download ALL as ZIP",
         data=zip_buf.getvalue(),
         file_name=f"{zip_name_prefix}_{ts}.zip",
         mime="application/zip",
@@ -376,9 +429,40 @@ def _metadata_to_imageless_dataframe(metadata: dict) -> pd.DataFrame:
         inventory_tracker=inventory_tracker,
         image_links=None,
         excluded_colors=excluded_colors,
+        excluded_garments=excluded_garments,
         page_titles=metadata.get("page_titles", []),
     )
     return ensure_shopify_csv_fields(df)
+
+
+def _split_exclusion_values(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        values = value
+    else:
+        values = re.split(r"[,|\n]", str(value))
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def _metadata_exclusions(metadata: dict, keys: list[str]) -> list[str]:
+    values = []
+    for key in keys:
+        values.extend(_split_exclusion_values(metadata.get(key)))
+    return values
+
+
+def _merge_exclusions(*groups) -> list[str]:
+    merged = []
+    seen = set()
+    for group in groups:
+        for item in group or []:
+            cleaned = str(item).strip()
+            key = cleaned.lower()
+            if cleaned and key not in seen:
+                merged.append(cleaned)
+                seen.add(key)
+    return merged
 
 
 def _render_manual_page_title_lengths(page_title_items: list[str]) -> None:
@@ -435,6 +519,13 @@ COMPLETED_ROOT = os.getenv(
     "/Spoofy/Portrait/1. uk office folder/1. Uk office Completed"
 )
 
+LIVE_DEPLOYMENT_MODE = os.getenv("SKU_APP_LIVE_DEPLOYMENT", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+
 CSV_MAX_MB   = float(os.getenv("SHOPIFY_PRODUCT_CSV_MAX_MB", "14.5"))
 CSV_MAX_ROWS = int(os.getenv("SHOPIFY_PRODUCT_CSV_MAX_ROWS", "0"))
 
@@ -457,57 +548,61 @@ legacy_token = (os.getenv("SHOPIFY_API_PASSWORD") or os.getenv("SHOPIFY_ADMIN_AP
 if not STORE_PROFILES and legacy_url and legacy_token:
     STORE_PROFILES.append({"label": f"{legacy_url} (legacy env)", "url": legacy_url, "token": legacy_token})
 
-with st.sidebar:
-    st.header("🛍️ Target Shopify Store")
-    if not STORE_PROFILES:
-        st.error("No store profiles found. Set SHOPIFY_STORE_URL_* and SHOPIFY_API_PASSWORD_* in dpbox.env.")
-    else:
-        labels = [p["label"] for p in STORE_PROFILES]
-        default_idx = 0
-        if "shop_profile_label" in st.session_state:
-            try:
-                default_idx = labels.index(st.session_state.shop_profile_label)
-            except ValueError:
-                pass
+if not LIVE_DEPLOYMENT_MODE:
+    with st.sidebar:
+        st.header(" Target Shopify Store")
+        if not STORE_PROFILES:
+            st.error("No store profiles found. Set SHOPIFY_STORE_URL_* and SHOPIFY_API_PASSWORD_* in dpbox.env.")
+        else:
+            labels = [p["label"] for p in STORE_PROFILES]
+            default_idx = 0
+            if "shop_profile_label" in st.session_state:
+                try:
+                    default_idx = labels.index(st.session_state.shop_profile_label)
+                except ValueError:
+                    pass
 
-        selected_label = st.selectbox("Choose store", labels, index=default_idx)
-        st.session_state.shop_profile_label = selected_label
-        sel = next(p for p in STORE_PROFILES if p["label"] == selected_label)
-        os.environ["SHOPIFY_STORE_URL"] = sel["url"]
-        os.environ["SHOPIFY_API_PASSWORD"] = sel["token"]
-        st.caption(f"Active store: `{sel['url']}`")
+            selected_label = st.selectbox("Choose store", labels, index=default_idx)
+            st.session_state.shop_profile_label = selected_label
+            sel = next(p for p in STORE_PROFILES if p["label"] == selected_label)
+            os.environ["SHOPIFY_STORE_URL"] = sel["url"]
+            os.environ["SHOPIFY_API_PASSWORD"] = sel["token"]
+            st.caption(f"Active store: `{sel['url']}`")
 
-        if st.button("🔎 Check connection"):
-            try:
-                api_ver = os.getenv("SHOPIFY_API_VERSION", "2024-10")
-                r = requests.get(
-                    f"https://{sel['url']}/admin/api/{api_ver}/shop.json",
-                    headers={"X-Shopify-Access-Token": sel["token"], "Accept": "application/json"},
-                    timeout=int(os.getenv("SHOPIFY_HTTP_TIMEOUT", "120"))
-                )
-                limit = r.headers.get("X-Shopify-Shop-Api-Call-Limit")
-                st.write(f"Status: {r.status_code} — Call-Limit: {limit}")
-                if r.ok:
-                    st.success("Connected ✅")
-                else:
-                    st.error(r.text)
-            except Exception as e:
-                st.error(f"Check failed: {e}")
+            if st.button("🔎 Check connection"):
+                try:
+                    api_ver = os.getenv("SHOPIFY_API_VERSION", "2024-10")
+                    r = requests.get(
+                        f"https://{sel['url']}/admin/api/{api_ver}/shop.json",
+                        headers={"X-Shopify-Access-Token": sel["token"], "Accept": "application/json"},
+                        timeout=int(os.getenv("SHOPIFY_HTTP_TIMEOUT", "120"))
+                    )
+                    limit = r.headers.get("X-Shopify-Shop-Api-Call-Limit")
+                    st.write(f"Status: {r.status_code} — Call-Limit: {limit}")
+                    if r.ok:
+                        st.success("Connected ✅")
+                    else:
+                        st.error(r.text)
+                except Exception as e:
+                    st.error(f"Check failed: {e}")
+
 
 REQUIRED_ENV = [
-    "GOOGLE_KEYFILE",
     "DROPBOX_APP_KEY",
     "DROPBOX_APP_SECRET",
     "DROPBOX_REFRESH_TOKEN",
-    "FOLDER_PATH",
+    "FOLDER_PATH_Design",
 ]
+if not LIVE_DEPLOYMENT_MODE:
+    REQUIRED_ENV.extend(["GOOGLE_KEYFILE", "FOLDER_PATH"])
 missing = [k for k in REQUIRED_ENV if not os.getenv(k)]
 if missing:
-    st.warning(f"Environment missing: {', '.join(missing)}. Image mapping will be disabled until fixed.")
+    st.warning(f"Environment missing: {', '.join(missing)}. Some features will be disabled until fixed.")
 
 FOLDER_PATH  = os.getenv("FOLDER_PATH", "").strip()
 DESIGNS_ROOT = os.getenv("FOLDER_PATH_Design", "").strip()
 MOCKUP_ZIP_EXPECTED_IMAGES = int(os.getenv("MOCKUP_ZIP_EXPECTED_IMAGES", "80") or "80")
+
 
 # ---------- Session defaults ----------
 if "generating" not in st.session_state: st.session_state.generating = False
@@ -589,17 +684,37 @@ def build_design_dataframe(
     dbx: dropbox.Dropbox,
     folder: str,
     excluded_colors: list[str] = None,
+    excluded_garments: list[str] = None,
     mockup_source: str = "Dropbox",
     metadata: dict | None = None,
 ):
     folder_path = f"{DESIGNS_ROOT}/{folder}" if folder else None
     meta = metadata if metadata is not None else download_metadata(dbx, folder_path)
 
-    restrictions = meta.get("Restrictions", "")
-    if restrictions:
-        excluded_colors = [c.strip() for c in restrictions.split(",") if c.strip()]
-    else:
-        excluded_colors = []
+    metadata_excluded_colors = _metadata_exclusions(
+        meta,
+        [
+            "Restrictions",
+            "excluded_colors",
+            "excluded_colours",
+            "not_allowed_colors",
+            "not_allowed_colours",
+            "restricted_colors",
+            "restricted_colours",
+        ],
+    )
+    metadata_excluded_garments = _metadata_exclusions(
+        meta,
+        [
+            "excluded_garments",
+            "not_allowed_garments",
+            "restricted_garments",
+            "excluded_products",
+            "not_allowed_products",
+        ],
+    )
+    excluded_colors = _merge_exclusions(excluded_colors, metadata_excluded_colors)
+    excluded_garments = _merge_exclusions(excluded_garments, metadata_excluded_garments)
 
     product_name = meta.get("product_name", "").strip()
     sku_suffix   = meta.get("sku_suffix", "").strip().upper()
@@ -648,6 +763,7 @@ def build_design_dataframe(
         inventory_tracker=inventory_tracker,
         image_links=image_links,
         excluded_colors=excluded_colors,
+        excluded_garments=excluded_garments,
         page_titles=page_titles,
     )
     df = ensure_image_src_column(df)
@@ -661,14 +777,14 @@ def build_design_dataframe(
 st.title("🧵 SKU Generator for Shopify")
 
 # ---------- Sidebar (manual image loader) ----------
-if not st.session_state.generating:
+if not LIVE_DEPLOYMENT_MODE and not st.session_state.generating:
     with st.sidebar:
-        st.header("🖼️ Dropbox Image Loader (Manual tab)")
+        st.header("🖼 Dropbox Image Loader (Manual tab)")
         if st.button("🔄 Get / Refresh Image Links"):
             try:
                 dbx = get_dropbox_client() 
 
-                with st.spinner("⏳ Fetching image links from Dropbox..."):
+                with st.spinner(" Fetching image links from Dropbox..."):
                     links, failed = load_dropbox_image_links(dbx, FOLDER_PATH, total_images=80)
                 st.session_state.dropbox_image_links = links
                 st.session_state.dropbox_links_loaded = (len(links) == 80 and len(failed) == 0)
@@ -709,11 +825,19 @@ correct_colors_by_type = load_json("colors.json")
 # After loading colors.json
 ALL_COLORS = sorted({c for colors in correct_colors_by_type.values() for c in colors})
 
-excluded_colors = st.multiselect(
-    "Exclude these garment colors from the CSV",
-    options=ALL_COLORS,
-    help="If selected, variants in these colors will be skipped from CSV generation."
-)
+restriction_col1, restriction_col2 = st.columns(2)
+with restriction_col1:
+    excluded_colors = st.multiselect(
+        "Not allowed colours",
+        options=ALL_COLORS,
+        help="Variants in these colours will be skipped from CSV generation.",
+    )
+with restriction_col2:
+    excluded_garments = st.multiselect(
+        "Not allowed garments",
+        options=garment_keys,
+        help="Selected garment/product types will be skipped entirely.",
+    )
 
 
 
@@ -722,7 +846,7 @@ def _load_pipeline_json(path):
         return json.load(f)
 
 
-def _build_pipeline_csv_for_active_design(design_folder: str, excluded_colors=None):
+def _build_pipeline_csv_for_active_design(design_folder: str, excluded_colors=None, excluded_garments=None):
     design_path = Path(design_folder)
     metadata_path = design_path / "metadata.json"
     image_links_path = design_path / "image_links.json"
@@ -768,6 +892,7 @@ def _build_pipeline_csv_for_active_design(design_folder: str, excluded_colors=No
         inventory_tracker=inventory_tracker,
         image_links=image_links,
         excluded_colors=excluded_colors or [],
+        excluded_garments=excluded_garments or [],
         page_titles=metadata.get("page_titles", []),
     )
 
@@ -786,226 +911,230 @@ def _build_pipeline_csv_for_active_design(design_folder: str, excluded_colors=No
 
 
 # ---------- Tabs ----------
-tab_manual, tab_pipeline, tab_auto = st.tabs(["Manual listing builder", "Pipeline Intake", "Auto from Dropbox"])
+if LIVE_DEPLOYMENT_MODE:
+    tab_auto = st.container()
+else:
+    tab_manual, tab_pipeline, tab_auto = st.tabs(["Manual listing builder", "Pipeline Intake", "Auto from Dropbox"])
 
 # =========================
 # Tab 1: Manual listing builder
 # =========================
-with tab_manual:
-    render_section_header("Manual listing builder")
+if not LIVE_DEPLOYMENT_MODE:
+    with tab_manual:
+        render_section_header("Manual listing builder")
 
-    if "manual_listing_builder" not in st.session_state:
-        st.session_state.manual_listing_builder = None
+        if "manual_listing_builder" not in st.session_state:
+            st.session_state.manual_listing_builder = None
 
-    manual_expected_count = len(garment_keys)
-    manual_defaults = {
-        "manual_output_mode": "Metadata JSON only",
-        "manual_product_name": "",
-        "manual_sku_suffix": "",
-        "manual_main_color": "",
-        "manual_tags": "",
-        "manual_page_titles": "",
-        "manual_descriptions": "",
-        "manual_lister": "Sal",
-        "manual_track_sku": False,
-    }
-    for key, value in manual_defaults.items():
-        st.session_state.setdefault(key, value)
-
-    action_col1, action_col2 = st.columns(2)
-    if action_col1.button("Fill example test listing"):
-        example = _build_manual_example_listing(manual_expected_count)
-        st.session_state.manual_output_mode = example["output_mode"]
-        st.session_state.manual_product_name = example["product_name"]
-        st.session_state.manual_sku_suffix = example["sku_suffix"]
-        st.session_state.manual_main_color = example["main_color"]
-        st.session_state.manual_tags = example["tags"]
-        st.session_state.manual_page_titles = example["page_titles"]
-        st.session_state.manual_descriptions = example["descriptions"]
-        st.session_state.manual_lister = example["lister"]
-        st.session_state.manual_track_sku = example["track_sku"]
-        st.session_state.manual_listing_builder = None
-        st.rerun()
-
-    if action_col2.button("Clear manual form"):
+        manual_expected_count = len(garment_keys)
+        manual_defaults = {
+            "manual_output_mode": "Metadata JSON only",
+            "manual_product_name": "",
+            "manual_sku_suffix": "",
+            "manual_main_color": "",
+            "manual_tags": "",
+            "manual_page_titles": "",
+            "manual_descriptions": "",
+            "manual_lister": "Sal",
+            "manual_track_sku": False,
+        }
         for key, value in manual_defaults.items():
-            st.session_state[key] = value
-        st.session_state.manual_listing_builder = None
-        st.rerun()
+            st.session_state.setdefault(key, value)
 
-    output_mode = st.radio(
-        "Build output",
-        ["Metadata JSON only", "Imageless CSV only", "Both JSON and CSV"],
-        horizontal=True,
-        key="manual_output_mode",
-    )
-    product_name = st.text_input("Product name", key="manual_product_name")
-    sku_suffix = st.text_input("SKU suffix", key="manual_sku_suffix").strip().upper()
-    main_color = st.text_input("Main color", key="manual_main_color").strip()
-    tags = st.text_input("Tags, comma-separated", key="manual_tags").strip()
-    tag_count = len([tag.strip() for tag in tags.split(",") if tag.strip()])
-    st.caption(f"Tags: {tag_count}")
-    if tags and tag_count < MANUAL_MIN_TAG_COUNT:
-        st.warning(
-            f"Recommended: add at least {MANUAL_MIN_TAG_COUNT} tags. "
-            f"You currently have {tag_count}."
+        action_col1, action_col2 = st.columns(2)
+        if action_col1.button("Fill example test listing"):
+            example = _build_manual_example_listing(manual_expected_count)
+            st.session_state.manual_output_mode = example["output_mode"]
+            st.session_state.manual_product_name = example["product_name"]
+            st.session_state.manual_sku_suffix = example["sku_suffix"]
+            st.session_state.manual_main_color = example["main_color"]
+            st.session_state.manual_tags = example["tags"]
+            st.session_state.manual_page_titles = example["page_titles"]
+            st.session_state.manual_descriptions = example["descriptions"]
+            st.session_state.manual_lister = example["lister"]
+            st.session_state.manual_track_sku = example["track_sku"]
+            st.session_state.manual_listing_builder = None
+            st.rerun()
+
+        if action_col2.button("Clear manual form"):
+            for key, value in manual_defaults.items():
+                st.session_state[key] = value
+            st.session_state.manual_listing_builder = None
+            st.rerun()
+
+        output_mode = st.radio(
+            "Build output",
+            ["Metadata JSON only", "Imageless CSV only", "Both JSON and CSV"],
+            horizontal=True,
+            key="manual_output_mode",
         )
+        product_name = st.text_input("Product name", key="manual_product_name")
+        sku_suffix = st.text_input("SKU suffix", key="manual_sku_suffix").strip().upper()
+        main_color = st.text_input("Main color", key="manual_main_color").strip()
+        tags = st.text_input("Tags, comma-separated", key="manual_tags").strip()
+        tag_count = len([tag.strip() for tag in tags.split(",") if tag.strip()])
+        st.caption(f"Tags: {tag_count}")
+        if tags and tag_count < MANUAL_MIN_TAG_COUNT:
+            st.warning(
+                f"Recommended: add at least {MANUAL_MIN_TAG_COUNT} tags. "
+                f"You currently have {tag_count}."
+            )
 
-    page_titles = st.text_area("Page titles", height=160, key="manual_page_titles")
-    page_title_items = _split_manual_items(page_titles, allow_pipe_separator=False)
-    st.caption(f"Page titles: {len(page_title_items)} / {manual_expected_count}")
-    if page_title_items and len(page_title_items) != manual_expected_count:
-        st.warning(f"Paste one page title per line. You have {len(page_title_items)}; expected {manual_expected_count}.")
+        page_titles = st.text_area("Page titles", height=160, key="manual_page_titles")
+        page_title_items = _split_manual_items(page_titles, allow_pipe_separator=False)
+        st.caption(f"Page titles: {len(page_title_items)} / {manual_expected_count}")
+        if page_title_items and len(page_title_items) != manual_expected_count:
+            st.warning(f"Paste one page title per line. You have {len(page_title_items)}; expected {manual_expected_count}.")
 
-    if page_title_items:
-        with st.expander("Page title length preview", expanded=False):
-            try:
-                with st.container(height=260):
+        if page_title_items:
+            with st.expander("Page title length preview", expanded=False):
+                try:
+                    with st.container(height=260):
+                        _render_manual_page_title_lengths(page_title_items)
+                except TypeError:
                     _render_manual_page_title_lengths(page_title_items)
-            except TypeError:
-                _render_manual_page_title_lengths(page_title_items)
 
-    descriptions = st.text_area("Descriptions", height=300, key="manual_descriptions")
-    description_items = _split_manual_items(descriptions, allow_pipe_separator=False)
-    st.caption(f"Descriptions: {len(description_items)} / {manual_expected_count}")
-    if description_items and len(description_items) != manual_expected_count:
-        st.warning(f"Paste one description per line. You have {len(description_items)}; expected {manual_expected_count}.")
+        descriptions = st.text_area("Descriptions", height=300, key="manual_descriptions")
+        description_items = _split_manual_items(descriptions, allow_pipe_separator=False)
+        st.caption(f"Descriptions: {len(description_items)} / {manual_expected_count}")
+        if description_items and len(description_items) != manual_expected_count:
+            st.warning(f"Paste one description per line. You have {len(description_items)}; expected {manual_expected_count}.")
 
-    lister = st.selectbox("Lister", ["Sal", "Hannan"], key="manual_lister")
-    track_sku = st.checkbox("Enable SKU tracking", key="manual_track_sku")
-    submit = st.button("Build listing")
+        lister = st.selectbox("Lister", ["Sal", "Hannan"], key="manual_lister")
+        track_sku = st.checkbox("Enable SKU tracking", key="manual_track_sku")
+        submit = st.button("Build listing")
 
-    if submit:
-        st.session_state.generating = True
-        st.session_state.manual_listing_builder = None
-        try:
-            metadata = _build_manual_metadata(
-                product_name=product_name,
-                sku_suffix=sku_suffix,
-                main_color=main_color,
-                tags=tags,
-                page_titles=page_titles,
-                descriptions=descriptions,
-            )
-            sku_label = metadata.get("sku_suffix") or "Manual listing"
-            wants_json = output_mode in {"Metadata JSON only", "Both JSON and CSV"}
-            wants_csv = output_mode in {"Imageless CSV only", "Both JSON and CSV"}
-            metadata_validation = validate_listing_metadata(
-                metadata,
-                label=sku_label,
-                min_tag_count=MANUAL_MIN_TAG_COUNT,
-            )
-            csv_validation = None
-            df = None
-            tracking_error = None
+        if submit:
+            st.session_state.generating = True
+            st.session_state.manual_listing_builder = None
+            try:
+                metadata = _build_manual_metadata(
+                    product_name=product_name,
+                    sku_suffix=sku_suffix,
+                    main_color=main_color,
+                    tags=tags,
+                    page_titles=page_titles,
+                    descriptions=descriptions,
+                )
+                sku_label = metadata.get("sku_suffix") or "Manual listing"
+                wants_json = output_mode in {"Metadata JSON only", "Both JSON and CSV"}
+                wants_csv = output_mode in {"Imageless CSV only", "Both JSON and CSV"}
+                metadata_validation = validate_listing_metadata(
+                    metadata,
+                    label=sku_label,
+                    min_tag_count=MANUAL_MIN_TAG_COUNT,
+                )
+                csv_validation = None
+                df = None
+                tracking_error = None
 
-            if track_sku and metadata.get("sku_suffix"):
-                sheet = connect_to_sheet("SKU Tracker")
-                existing_suffixes = [row[0].strip().upper() for row in sheet.get_all_values()[1:] if row]
-                if metadata["sku_suffix"] in existing_suffixes:
-                    tracking_error = "That SKU suffix is already used in Google Sheets. Please enter a new one."
+                if track_sku and metadata.get("sku_suffix"):
+                    sheet = connect_to_sheet("SKU Tracker")
+                    existing_suffixes = [row[0].strip().upper() for row in sheet.get_all_values()[1:] if row]
+                    if metadata["sku_suffix"] in existing_suffixes:
+                        tracking_error = "That SKU suffix is already used in Google Sheets. Please enter a new one."
 
-            if wants_csv and not has_validation_errors(metadata_validation):
-                df = _metadata_to_imageless_dataframe(metadata)
-                csv_validation = validate_shopify_dataframe(df, label=sku_label)
+                if wants_csv and not has_validation_errors(metadata_validation):
+                    df = _metadata_to_imageless_dataframe(metadata)
+                    csv_validation = validate_shopify_dataframe(df, label=sku_label)
 
-            has_blocking_errors = has_validation_errors(metadata_validation) or bool(tracking_error)
-            if wants_csv:
-                has_blocking_errors = has_blocking_errors or df is None or has_validation_errors(csv_validation or {})
+                has_blocking_errors = has_validation_errors(metadata_validation) or bool(tracking_error)
+                if wants_csv:
+                    has_blocking_errors = has_blocking_errors or df is None or has_validation_errors(csv_validation or {})
 
-            if track_sku and not has_blocking_errors:
-                sheet = connect_to_sheet("SKU Tracker")
-                sheet.append_row([metadata["sku_suffix"], lister, datetime.now().isoformat()])
+                if track_sku and not has_blocking_errors:
+                    sheet = connect_to_sheet("SKU Tracker")
+                    sheet.append_row([metadata["sku_suffix"], lister, datetime.now().isoformat()])
 
-            st.session_state.manual_listing_builder = {
-                "mode": output_mode,
-                "wants_json": wants_json,
-                "wants_csv": wants_csv,
-                "metadata": metadata,
-                "metadata_validation": metadata_validation,
-                "df": df,
-                "csv_validation": csv_validation,
-                "tracking_error": tracking_error,
-                "has_blocking_errors": has_blocking_errors,
-                "json_filename": f"{metadata.get('sku_suffix', '').strip().upper()}_metadata.json",
-                "csv_filename": f"{metadata.get('sku_suffix', '').strip().upper()}.csv",
-            }
-        except Exception as e:
-            st.error("Something went wrong while building the manual listing.")
-            st.exception(e)
-        finally:
-            st.session_state.generating = False
+                st.session_state.manual_listing_builder = {
+                    "mode": output_mode,
+                    "wants_json": wants_json,
+                    "wants_csv": wants_csv,
+                    "metadata": metadata,
+                    "metadata_validation": metadata_validation,
+                    "df": df,
+                    "csv_validation": csv_validation,
+                    "tracking_error": tracking_error,
+                    "has_blocking_errors": has_blocking_errors,
+                    "json_filename": f"{metadata.get('sku_suffix', '').strip().upper()}_metadata.json",
+                    "csv_filename": f"{metadata.get('sku_suffix', '').strip().upper()}.csv",
+                }
+            except Exception as e:
+                st.error("Something went wrong while building the manual listing.")
+                st.exception(e)
+            finally:
+                st.session_state.generating = False
 
-    manual_result = st.session_state.manual_listing_builder
-    if manual_result:
-        st.markdown("#### Metadata validation")
-        _render_listing_safety_checks(manual_result["metadata_validation"])
+        manual_result = st.session_state.manual_listing_builder
+        if manual_result:
+            st.markdown("#### Metadata validation")
+            _render_listing_safety_checks(manual_result["metadata_validation"])
 
-        if manual_result.get("tracking_error"):
-            st.error(manual_result["tracking_error"])
+            if manual_result.get("tracking_error"):
+                st.error(manual_result["tracking_error"])
 
-        if manual_result["wants_csv"] and manual_result.get("csv_validation"):
-            st.markdown("#### CSV validation")
-            _render_listing_safety_checks(manual_result["csv_validation"])
+            if manual_result["wants_csv"] and manual_result.get("csv_validation"):
+                st.markdown("#### CSV validation")
+                _render_listing_safety_checks(manual_result["csv_validation"])
 
-        if not manual_result["has_blocking_errors"]:
-            metadata = manual_result["metadata"]
-            if manual_result["wants_json"]:
-                with st.container(border=True):
-                    st.markdown("#### Metadata JSON")
-                    st.caption(manual_result["json_filename"])
-                    st.download_button(
-                        "Download metadata JSON",
-                        data=_metadata_to_json_bytes(metadata),
-                        file_name=manual_result["json_filename"],
-                        mime="application/json",
-                    )
+            if not manual_result["has_blocking_errors"]:
+                metadata = manual_result["metadata"]
+                if manual_result["wants_json"]:
+                    with st.container(border=True):
+                        st.markdown("#### Metadata JSON")
+                        st.caption(manual_result["json_filename"])
+                        st.download_button(
+                            "Download metadata JSON",
+                            data=_metadata_to_json_bytes(metadata),
+                            file_name=manual_result["json_filename"],
+                            mime="application/json",
+                        )
 
-            if manual_result["wants_csv"]:
-                df = manual_result["df"]
-                csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-                with st.container(border=True):
-                    st.markdown("#### Imageless CSV")
-                    st.caption(manual_result["csv_filename"])
-                    st.download_button(
-                        "Download imageless CSV",
-                        data=csv_bytes,
-                        file_name=manual_result["csv_filename"],
-                        mime="text/csv",
-                    )
+                if manual_result["wants_csv"]:
+                    df = manual_result["df"]
+                    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+                    with st.container(border=True):
+                        st.markdown("#### Imageless CSV")
+                        st.caption(manual_result["csv_filename"])
+                        st.download_button(
+                            "Download imageless CSV",
+                            data=csv_bytes,
+                            file_name=manual_result["csv_filename"],
+                            mime="text/csv",
+                        )
 
-                    if st.button("Send to Shopify"):
-                        with st.status("Uploading to Shopify...", expanded=True) as s:
-                            try:
-                                def emit(msg: str): s.write(msg)
-                                results = upload_products_from_df(df, progress=emit)
-                                s.update(label="Upload complete")
-                                st.success(f"Uploaded {len(results)} products.")
-                                st.json(results)
-                            except ShopifyError as e:
-                                if str(e).startswith("DAILY_VARIANT_LIMIT:"):
-                                    s.update(label="Daily variant creation limit hit")
-                                    st.error("You've hit Shopify's daily variant creation limit. Use CSV import now or resume via API tomorrow.")
-                                else:
-                                    s.update(label="Shopify upload failed")
-                                    st.error(f"Shopify error: {e}")
-                            except Exception as e:
-                                s.update(label="Unexpected error during upload")
-                                st.error(f"Unexpected error: {e}")
+                        if st.button("Send to Shopify"):
+                            with st.status("Uploading to Shopify...", expanded=True) as s:
+                                try:
+                                    def emit(msg: str): s.write(msg)
+                                    results = upload_products_from_df(df, progress=emit)
+                                    s.update(label="Upload complete")
+                                    st.success(f"Uploaded {len(results)} products.")
+                                    st.json(results)
+                                except ShopifyError as e:
+                                    if str(e).startswith("DAILY_VARIANT_LIMIT:"):
+                                        s.update(label="Daily variant creation limit hit")
+                                        st.error("You've hit Shopify's daily variant creation limit. Use CSV import now or resume via API tomorrow.")
+                                    else:
+                                        s.update(label="Shopify upload failed")
+                                        st.error(f"Shopify error: {e}")
+                                except Exception as e:
+                                    s.update(label="Unexpected error during upload")
+                                    st.error(f"Unexpected error: {e}")
 
-                with st.expander("Preview Descriptions"):
-                    key_col = "Base Type" if "Base Type" in df.columns else "Type"
-                    for garment in garment_keys:
-                        st.markdown(f"**{garment}**", unsafe_allow_html=True)
+                    with st.expander("Preview Descriptions"):
+                        key_col = "Base Type" if "Base Type" in df.columns else "Type"
+                        for garment in garment_keys:
+                            st.markdown(f"**{garment}**", unsafe_allow_html=True)
 
-                        sub = df[df[key_col] == garment]
-                        if sub.empty:
-                            st.warning(f"No rows found for '{garment}' (preview only).")
+                            sub = df[df[key_col] == garment]
+                            if sub.empty:
+                                st.warning(f"No rows found for '{garment}' (preview only).")
+                                st.markdown("---")
+                                continue
+
+                            st.markdown(sub.iloc[0]["Body (HTML)"], unsafe_allow_html=True)
                             st.markdown("---")
-                            continue
-
-                        st.markdown(sub.iloc[0]["Body (HTML)"], unsafe_allow_html=True)
-                        st.markdown("---")
 # ------------------------------------------------------------
 # Helpers for Auto tab
 # ------------------------------------------------------------
@@ -1080,19 +1209,162 @@ def _dropbox_folder_has_metadata(dbx: dropbox.Dropbox, folder_path: str) -> bool
         for entry in entries
     )
 
+def _normalise_sku(value: str) -> str:
+    return str(value or "").strip().upper()
+
+def _uploaded_file_stem(uploaded_file) -> str:
+    filename = getattr(uploaded_file, "name", "") or ""
+    return os.path.splitext(os.path.basename(filename))[0].strip()
+
+def _metadata_index_from_uploads(uploaded_jsons) -> tuple[dict[str, dict], list[dict]]:
+    index = {}
+    rows = []
+
+    for uploaded_json in uploaded_jsons or []:
+        filename = getattr(uploaded_json, "name", "") or "metadata.json"
+        row = {
+            "JSON file": filename,
+            "Detected SKU": "",
+            "Status": "Blocked",
+            "Errors": "",
+        }
+
+        try:
+            metadata = load_metadata_json(uploaded_json)
+            sku = _normalise_sku(metadata.get("sku_suffix"))
+            issues = _metadata_issues(metadata)[0]
+        except Exception as exc:
+            rows.append({**row, "Errors": str(exc)})
+            continue
+
+        row["Detected SKU"] = sku
+        if not sku:
+            row["Errors"] = "Missing sku_suffix."
+        elif sku in index:
+            row["Errors"] = f"Duplicate metadata JSON for SKU {sku}."
+        elif issues:
+            row["Errors"] = "; ".join(issues)
+        else:
+            row["Status"] = "Ready"
+            index[sku] = {"file": uploaded_json, "metadata": metadata, "filename": filename}
+
+        rows.append(row)
+
+    return index, rows
+
+def _upload_metadata_json_to_dropbox(
+    dbx: dropbox.Dropbox,
+    folder_path: str,
+    metadata: dict,
+    overwrite: bool = True,
+) -> dict:
+    target_path = f"{folder_path.rstrip('/')}/metadata.json"
+    exists = _dbx_exists(dbx, target_path)
+
+    if exists and not overwrite:
+        return {"uploaded": False, "skipped": True, "path": target_path, "error": ""}
+
+    mode = dropbox.files.WriteMode.overwrite if overwrite else dropbox.files.WriteMode.add
+    try:
+        dbx.files_upload(_metadata_to_json_bytes(metadata), target_path, mode=mode, mute=True)
+    except Exception as exc:
+        return {"uploaded": False, "skipped": False, "path": target_path, "error": str(exc)}
+
+    return {"uploaded": True, "skipped": False, "path": target_path, "error": ""}
+
+def _dropbox_join(*parts: str) -> str:
+    cleaned = [str(part or "").strip("/") for part in parts if str(part or "").strip("/")]
+    return "/" + "/".join(cleaned)
+
+def _ensure_dropbox_folder(dbx: dropbox.Dropbox, path: str) -> None:
+    path = _dropbox_join(path)
+    current = ""
+    for part in [part for part in path.strip("/").split("/") if part]:
+        current = f"{current}/{part}"
+        if not _dbx_exists(dbx, current):
+            dbx.files_create_folder_v2(current)
+
+def _list_dropbox_folder_entries(dbx: dropbox.Dropbox, path: str):
+    result = dbx.files_list_folder(path)
+    entries = list(result.entries)
+    while result.has_more:
+        result = dbx.files_list_folder_continue(result.cursor)
+        entries.extend(result.entries)
+    return entries
+
+def _list_dropbox_note_files(dbx: dropbox.Dropbox, folder_path: str) -> list:
+    try:
+        entries = _list_dropbox_folder_entries(dbx, folder_path)
+    except Exception:
+        return []
+
+    return [
+        entry for entry in entries
+        if isinstance(entry, dropbox.files.FileMetadata)
+        and entry.name.lower().endswith((".txt", ".pdf"))
+    ]
+
+def _is_design_art_filename(filename: str) -> bool:
+    stem, ext = os.path.splitext(str(filename or ""))
+    return ext.lower() in {".png", ".jpg", ".jpeg", ".webp"} and not stem.isdigit()
+
+def _list_design_art_files(dbx: dropbox.Dropbox, folder_path: str, folder_name: str):
+    try:
+        entries = _list_dropbox_folder_entries(dbx, folder_path)
+    except Exception:
+        return []
+
+    expected_stem = str(folder_name or "").strip()
+    art_files = []
+    for entry in entries:
+        if not isinstance(entry, dropbox.files.FileMetadata):
+            continue
+        stem, ext = os.path.splitext(entry.name)
+        if ext.lower() in {".png", ".jpg", ".jpeg", ".webp"} and not stem.isdigit():
+            art_files.append(entry)
+
+    return sorted(
+        art_files,
+        key=lambda entry: (
+            os.path.splitext(entry.name)[0] != expected_stem,
+            entry.name.lower(),
+        ),
+    )
+
+def _download_dropbox_file_bytes(dbx: dropbox.Dropbox, path: str) -> bytes:
+    _, response = dbx.files_download(path)
+    return response.content
+
+def _decode_note_text(content: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", errors="replace")
+
 def move_selected_to_finished(dbx: dropbox.Dropbox, folder: str) -> str:
-    from utils.dropbox_utils import move_to_finished, get_dropbox_client
-    final_path = move_to_finished(get_dropbox_client(), DESIGNS_ROOT, folder, finished_dir=FINISHED_DIR_NAME)
-    return final_path
+    folder = str(folder or "").strip().strip("/")
+    if not folder:
+        raise RuntimeError("No folder selected.")
+
+    source_path = _dropbox_join(DESIGNS_ROOT, folder)
+    finished_path = _dropbox_join(DESIGNS_ROOT, FINISHED_DIR_NAME, folder)
+
+    if _dbx_exists(dbx, finished_path):
+        return finished_path
+
+    if not _dbx_exists(dbx, source_path):
+        raise RuntimeError(f"Folder not found at {source_path} or {finished_path}")
+
+    return move_to_finished(dbx, DESIGNS_ROOT, folder, finished_dir=FINISHED_DIR_NAME)
 
 def clean_and_archive_to_completed(dbx: dropbox.Dropbox, folder: str) -> tuple[int, str]:
-    finished_path = f"{DESIGNS_ROOT}/{FINISHED_DIR_NAME}/{folder}"
-    if not _dbx_exists(dbx, finished_path):
-        raise RuntimeError(f"Folder not in /{FINISHED_DIR_NAME}: {finished_path}")
+    finished_path = move_selected_to_finished(dbx, folder)
 
     pat = re.compile(r"^([1-9]\d{0,2})\.(png|jpg|jpeg|webp)$", re.IGNORECASE)
     deleted = 0
-    entries = dbx.files_list_folder(finished_path).entries
+    entries = _list_dropbox_folder_entries(dbx, finished_path)
     for e in entries:
         if isinstance(e, dropbox.files.FileMetadata):
             m = pat.match(e.name)
@@ -1103,225 +1375,77 @@ def clean_and_archive_to_completed(dbx: dropbox.Dropbox, folder: str) -> tuple[i
                 dbx.files_delete_v2(f"{finished_path}/{e.name}")
                 deleted += 1
 
-    _ensure_folder(dbx, COMPLETED_ROOT)
-    dest = f"{COMPLETED_ROOT}/{folder}"
-    dbx.files_move_v2(finished_path, dest, autorename=True)
-    return deleted, dest
+    _ensure_dropbox_folder(dbx, COMPLETED_ROOT)
+    dest = _dropbox_join(COMPLETED_ROOT, folder)
+    res = dbx.files_move_v2(finished_path, dest, autorename=True)
+    return deleted, res.metadata.path_display
 
 
 # =========================
 # Tab 2: Pipeline Intake
 # =========================
-with tab_pipeline:
-    render_section_header(
-        "Pipeline Intake",
-        "Digest Canva mockup ZIPs into local staged or ready folders.",
-    )
-
-    pipeline_root = st.text_input(
-        "Pipeline root folder",
-        value="pipeline_data",
-        key="pipeline_root",
-        help="Local folder where staged, ready, active, and finished designs are stored.",
-    )
-
-    uploaded_pipeline_zip = st.file_uploader(
-        "Mockup ZIP",
-        type=["zip"],
-        key="pipeline_mockup_zip",
-        help="Upload one Canva mockup ZIP for one design/SKU.",
-    )
-
-    uploaded_pipeline_json = st.file_uploader(
-        "Metadata JSON optional",
-        type=["json"],
-        key="pipeline_metadata_json",
-        help="Upload metadata JSON now, or leave empty and add it later.",
-    )
-
-    overwrite_pipeline_design = st.checkbox(
-        "Overwrite existing design folder",
-        value=True,
-        key="pipeline_overwrite_design",
-    )
-
-    if st.button("Digest ZIP", key="pipeline_digest_zip_btn"):
-        if uploaded_pipeline_zip is None:
-            st.error("Upload a mockup ZIP first.")
-        else:
-            report = digest_mockup_zip_to_pipeline(
-                uploaded_pipeline_zip,
-                uploaded_json=uploaded_pipeline_json,
-                pipeline_root=pipeline_root,
-                expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
-                overwrite=overwrite_pipeline_design,
-            )
-
-            if report.get("ready"):
-                st.success("Design is ready.")
-            else:
-                st.warning("Design staged but not ready.")
-
-            col1, col2, col3 = st.columns(3)
-            col1.metric("SKU", report.get("sku") or "Missing")
-            col2.metric("Images", report.get("image_count", 0))
-            col3.metric("Status", report.get("status", "unknown"))
-
-            st.write("Design folder:", report.get("design_folder"))
-            st.write("Mockups folder:", report.get("mockups_folder"))
-            st.write("Metadata path:", report.get("metadata_path"))
-
-            issues = report.get("issues", [])
-            warnings = report.get("warnings", [])
-
-            if issues:
-                st.error("Issues")
-                for issue in issues:
-                    st.write(f"- {issue}")
-
-            if warnings:
-                st.warning("Warnings")
-                for warning in warnings:
-                    st.write(f"- {warning}")
-
-            image_files = report.get("image_files", [])
-            if image_files:
-                st.write("First mapped images")
-                st.code("\n".join(image_files[:10]))
-
-    st.divider()
-
-    render_section_header("Pipeline folders")
-
-    pipeline_scan = scan_pipeline_folders(
-        pipeline_root=pipeline_root,
-        expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
-    )
-
-    staged_rows = pipeline_scan.get("staged", [])
-    ready_rows = pipeline_scan.get("ready", [])
-
-    col_staged, col_ready = st.columns(2)
-    col_staged.metric("Staged", len(staged_rows))
-    col_ready.metric("Ready", len(ready_rows))
-
-    st.markdown("#### Staged designs")
-    if staged_rows:
-        st.dataframe(pd.DataFrame(staged_rows), width="stretch")
-    else:
-        st.info("No staged designs yet.")
-
-    st.markdown("#### Add metadata to staged design")
-
-    if staged_rows:
-        staged_skus = [row["SKU"] for row in staged_rows]
-        selected_staged_sku = st.selectbox(
-            "Select staged design",
-            staged_skus,
-            key="pipeline_attach_json_sku",
+if not LIVE_DEPLOYMENT_MODE:
+    with tab_pipeline:
+        render_section_header(
+            "Pipeline Intake",
+            "Digest Canva mockup ZIPs into local staged or ready folders.",
         )
 
-        uploaded_late_json = st.file_uploader(
-            "Metadata JSON for selected staged design",
-            type=["json"],
-            key="pipeline_attach_metadata_json",
+        pipeline_root = st.text_input(
+            "Pipeline root folder",
+            value="pipeline_data",
+            key="pipeline_root",
+            help="Local folder where staged, ready, active, and finished designs are stored.",
         )
 
-        overwrite_late_metadata = st.checkbox(
-            "Overwrite metadata if it already exists",
-            value=True,
-            key="pipeline_attach_overwrite_metadata",
-        )
-
-        if st.button("Attach JSON and Revalidate", key="pipeline_attach_json_btn"):
-            if uploaded_late_json is None:
-                st.error("Upload a metadata JSON first.")
-            else:
-                attach_report = attach_metadata_to_pipeline_design(
-                    selected_staged_sku,
-                    uploaded_late_json,
-                    pipeline_root=pipeline_root,
-                    expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
-                    overwrite=overwrite_late_metadata,
-                )
-
-                if attach_report.get("ready"):
-                    st.success("Metadata attached. Design moved to ready.")
-                else:
-                    st.warning("Metadata attached, but design is still not ready.")
-
-                col1, col2, col3 = st.columns(3)
-                col1.metric("SKU", attach_report.get("sku") or "Missing")
-                col2.metric("Images", attach_report.get("image_count", 0))
-                col3.metric("Status", attach_report.get("status", "unknown"))
-
-                st.write("Design folder:", attach_report.get("design_folder"))
-                st.write("Metadata path:", attach_report.get("metadata_path"))
-
-                issues = attach_report.get("issues", [])
-                warnings = attach_report.get("warnings", [])
-
-                if issues:
-                    st.error("Issues")
-                    for issue in issues:
-                        st.write(f"- {issue}")
-
-                if warnings:
-                    st.warning("Warnings")
-                    for warning in warnings:
-                        st.write(f"- {warning}")
-    else:
-        st.info("No staged designs available for metadata attachment.")
-
-    st.markdown("#### Replace mockups for staged design")
-
-    if staged_rows:
-        staged_skus_for_mockups = [row["SKU"] for row in staged_rows]
-        selected_mockup_replace_sku = st.selectbox(
-            "Select staged design to replace mockups",
-            staged_skus_for_mockups,
-            key="pipeline_replace_mockups_sku",
-        )
-
-        uploaded_replacement_zip = st.file_uploader(
-            "Replacement mockup ZIP",
+        uploaded_pipeline_zip = st.file_uploader(
+            "Mockup ZIP",
             type=["zip"],
-            key="pipeline_replacement_mockup_zip",
+            key="pipeline_mockup_zip",
+            help="Upload one Canva mockup ZIP for one design/SKU.",
         )
 
-        overwrite_replacement_mockups = st.checkbox(
-            "Overwrite existing mockups",
+        uploaded_pipeline_json = st.file_uploader(
+            "Metadata JSON optional",
+            type=["json"],
+            key="pipeline_metadata_json",
+            help="Upload metadata JSON now, or leave empty and add it later.",
+        )
+
+        overwrite_pipeline_design = st.checkbox(
+            "Overwrite existing design folder",
             value=True,
-            key="pipeline_replace_mockups_overwrite",
+            key="pipeline_overwrite_design",
         )
 
-        if st.button("Replace Mockups and Revalidate", key="pipeline_replace_mockups_btn"):
-            if uploaded_replacement_zip is None:
-                st.error("Upload a replacement mockup ZIP first.")
+        if st.button("Digest ZIP", key="pipeline_digest_zip_btn"):
+            if uploaded_pipeline_zip is None:
+                st.error("Upload a mockup ZIP first.")
             else:
-                replace_report = replace_pipeline_design_mockups(
-                    selected_mockup_replace_sku,
-                    uploaded_replacement_zip,
+                report = digest_mockup_zip_to_pipeline(
+                    uploaded_pipeline_zip,
+                    uploaded_json=uploaded_pipeline_json,
                     pipeline_root=pipeline_root,
                     expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
-                    overwrite=overwrite_replacement_mockups,
+                    overwrite=overwrite_pipeline_design,
                 )
 
-                if replace_report.get("ready"):
-                    st.success("Mockups replaced. Design moved to ready.")
+                if report.get("ready"):
+                    st.success("Design is ready.")
                 else:
-                    st.warning("Mockups replaced, but design is still not ready.")
+                    st.warning("Design staged but not ready.")
 
                 col1, col2, col3 = st.columns(3)
-                col1.metric("SKU", replace_report.get("sku") or "Missing")
-                col2.metric("Images", replace_report.get("image_count", 0))
-                col3.metric("Status", replace_report.get("status", "unknown"))
+                col1.metric("SKU", report.get("sku") or "Missing")
+                col2.metric("Images", report.get("image_count", 0))
+                col3.metric("Status", report.get("status", "unknown"))
 
-                st.write("Design folder:", replace_report.get("design_folder"))
-                st.write("Mockups folder:", replace_report.get("mockups_folder"))
+                st.write("Design folder:", report.get("design_folder"))
+                st.write("Mockups folder:", report.get("mockups_folder"))
+                st.write("Metadata path:", report.get("metadata_path"))
 
-                issues = replace_report.get("issues", [])
-                warnings = replace_report.get("warnings", [])
+                issues = report.get("issues", [])
+                warnings = report.get("warnings", [])
 
                 if issues:
                     st.error("Issues")
@@ -1333,161 +1457,944 @@ with tab_pipeline:
                     for warning in warnings:
                         st.write(f"- {warning}")
 
-                image_files = replace_report.get("image_files", [])
+                image_files = report.get("image_files", [])
                 if image_files:
                     st.write("First mapped images")
                     st.code("\n".join(image_files[:10]))
-    else:
-        st.info("No staged designs available for mockup replacement.")
 
-    st.markdown("#### Ready designs")
-    if ready_rows:
-        st.dataframe(pd.DataFrame(ready_rows), width="stretch")
-    else:
-        st.info("No ready designs yet.")
+        st.divider()
 
-    st.markdown("#### Host ready design images on Dropbox")
+        render_section_header("Pipeline folders")
 
-    if ready_rows:
-        ready_skus = [row["SKU"] for row in ready_rows]
-        selected_ready_sku = st.selectbox(
-            "Select ready design",
-            ready_skus,
-            key="pipeline_dropbox_ready_sku",
+        pipeline_scan = scan_pipeline_folders(
+            pipeline_root=pipeline_root,
+            expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
         )
 
-        dropbox_temp_root = st.text_input(
-            "Dropbox temp root folder",
-            value="/sku-generator-temp/active",
-            key="pipeline_dropbox_temp_root",
-            help="The app will create this folder automatically if it does not exist.",
-        )
+        staged_rows = pipeline_scan.get("staged", [])
+        ready_rows = pipeline_scan.get("ready", [])
 
-        overwrite_dropbox_temp = st.checkbox(
-            "Overwrite existing Dropbox temp files",
-            value=True,
-            key="pipeline_dropbox_overwrite",
-        )
+        col_staged, col_ready = st.columns(2)
+        col_staged.metric("Staged", len(staged_rows))
+        col_ready.metric("Ready", len(ready_rows))
 
-        if st.button("Upload Images to Dropbox Temp Hosting", key="pipeline_upload_dropbox_temp_btn"):
-            try:
-                dbx = get_dropbox_client()
-            except Exception as exc:
-                st.error(f"Could not connect to Dropbox: {exc}")
-            else:
-                with st.status("Uploading ready design images to Dropbox...", expanded=True) as s:
-                    upload_report = upload_ready_design_to_dropbox_temp(
-                        dbx,
-                        selected_ready_sku,
+        st.markdown("#### Staged designs")
+        if staged_rows:
+            st.dataframe(pd.DataFrame(staged_rows), width="stretch")
+        else:
+            st.info("No staged designs yet.")
+
+        st.markdown("#### Add metadata to staged design")
+
+        if staged_rows:
+            staged_skus = [row["SKU"] for row in staged_rows]
+            selected_staged_sku = st.selectbox(
+                "Select staged design",
+                staged_skus,
+                key="pipeline_attach_json_sku",
+            )
+
+            uploaded_late_json = st.file_uploader(
+                "Metadata JSON for selected staged design",
+                type=["json"],
+                key="pipeline_attach_metadata_json",
+            )
+
+            overwrite_late_metadata = st.checkbox(
+                "Overwrite metadata if it already exists",
+                value=True,
+                key="pipeline_attach_overwrite_metadata",
+            )
+
+            if st.button("Attach JSON and Revalidate", key="pipeline_attach_json_btn"):
+                if uploaded_late_json is None:
+                    st.error("Upload a metadata JSON first.")
+                else:
+                    attach_report = attach_metadata_to_pipeline_design(
+                        selected_staged_sku,
+                        uploaded_late_json,
                         pipeline_root=pipeline_root,
-                        dropbox_root=dropbox_temp_root,
                         expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
-                        overwrite=overwrite_dropbox_temp,
+                        overwrite=overwrite_late_metadata,
                     )
 
-                    s.write(f"Dropbox folder: {upload_report.get('dropbox_folder')}")
-                    s.write(f"Uploaded: {upload_report.get('uploaded', 0)}")
-                    s.write(f"Linked: {upload_report.get('linked', 0)}")
-                    s.write(f"Failed: {upload_report.get('failed', 0)}")
-
-                    if upload_report.get("ready"):
-                        s.update(label="Dropbox temp hosting complete.")
-                        st.success("Images uploaded and linked. Design moved to active.")
+                    if attach_report.get("ready"):
+                        st.success("Metadata attached. Design moved to ready.")
                     else:
-                        s.update(label="Dropbox temp hosting completed with issues.")
-                        st.warning("Dropbox hosting did not fully complete.")
+                        st.warning("Metadata attached, but design is still not ready.")
 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("SKU", upload_report.get("sku") or "Missing")
-                col2.metric("Uploaded", upload_report.get("uploaded", 0))
-                col3.metric("Linked", upload_report.get("linked", 0))
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("SKU", attach_report.get("sku") or "Missing")
+                    col2.metric("Images", attach_report.get("image_count", 0))
+                    col3.metric("Status", attach_report.get("status", "unknown"))
 
-                st.write("Design folder:", upload_report.get("design_folder"))
-                st.write("Dropbox folder:", upload_report.get("dropbox_folder"))
-                st.write("Image links path:", upload_report.get("image_links_path"))
+                    st.write("Design folder:", attach_report.get("design_folder"))
+                    st.write("Metadata path:", attach_report.get("metadata_path"))
 
-                issues = upload_report.get("issues", [])
-                warnings = upload_report.get("warnings", [])
+                    issues = attach_report.get("issues", [])
+                    warnings = attach_report.get("warnings", [])
 
-                if issues:
-                    st.error("Issues")
-                    for issue in issues:
-                        st.write(f"- {issue}")
+                    if issues:
+                        st.error("Issues")
+                        for issue in issues:
+                            st.write(f"- {issue}")
 
-                if warnings:
-                    st.warning("Warnings")
-                    for warning in warnings:
-                        st.write(f"- {warning}")
+                    if warnings:
+                        st.warning("Warnings")
+                        for warning in warnings:
+                            st.write(f"- {warning}")
+        else:
+            st.info("No staged designs available for metadata attachment.")
 
-                image_links = upload_report.get("image_links", {})
-                if image_links:
-                    st.write("First image links")
-                    sample_lines = [
-                        f"{key}: {value}"
-                        for key, value in list(image_links.items())[:5]
-                    ]
-                    st.code("\n".join(sample_lines))
-    else:
-        st.info("No ready designs available for Dropbox temp hosting.")
+        st.markdown("#### Replace mockups for staged design")
+
+        if staged_rows:
+            staged_skus_for_mockups = [row["SKU"] for row in staged_rows]
+            selected_mockup_replace_sku = st.selectbox(
+                "Select staged design to replace mockups",
+                staged_skus_for_mockups,
+                key="pipeline_replace_mockups_sku",
+            )
+
+            uploaded_replacement_zip = st.file_uploader(
+                "Replacement mockup ZIP",
+                type=["zip"],
+                key="pipeline_replacement_mockup_zip",
+            )
+
+            overwrite_replacement_mockups = st.checkbox(
+                "Overwrite existing mockups",
+                value=True,
+                key="pipeline_replace_mockups_overwrite",
+            )
+
+            if st.button("Replace Mockups and Revalidate", key="pipeline_replace_mockups_btn"):
+                if uploaded_replacement_zip is None:
+                    st.error("Upload a replacement mockup ZIP first.")
+                else:
+                    replace_report = replace_pipeline_design_mockups(
+                        selected_mockup_replace_sku,
+                        uploaded_replacement_zip,
+                        pipeline_root=pipeline_root,
+                        expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                        overwrite=overwrite_replacement_mockups,
+                    )
+
+                    if replace_report.get("ready"):
+                        st.success("Mockups replaced. Design moved to ready.")
+                    else:
+                        st.warning("Mockups replaced, but design is still not ready.")
+
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("SKU", replace_report.get("sku") or "Missing")
+                    col2.metric("Images", replace_report.get("image_count", 0))
+                    col3.metric("Status", replace_report.get("status", "unknown"))
+
+                    st.write("Design folder:", replace_report.get("design_folder"))
+                    st.write("Mockups folder:", replace_report.get("mockups_folder"))
+
+                    issues = replace_report.get("issues", [])
+                    warnings = replace_report.get("warnings", [])
+
+                    if issues:
+                        st.error("Issues")
+                        for issue in issues:
+                            st.write(f"- {issue}")
+
+                    if warnings:
+                        st.warning("Warnings")
+                        for warning in warnings:
+                            st.write(f"- {warning}")
+
+                    image_files = replace_report.get("image_files", [])
+                    if image_files:
+                        st.write("First mapped images")
+                        st.code("\n".join(image_files[:10]))
+        else:
+            st.info("No staged designs available for mockup replacement.")
+
+        st.markdown("#### Ready designs")
+        if ready_rows:
+            st.dataframe(pd.DataFrame(ready_rows), width="stretch")
+        else:
+            st.info("No ready designs yet.")
+
+        st.markdown("#### Host ready design images on Dropbox")
+
+        if ready_rows:
+            ready_skus = [row["SKU"] for row in ready_rows]
+            selected_ready_sku = st.selectbox(
+                "Select ready design",
+                ready_skus,
+                key="pipeline_dropbox_ready_sku",
+            )
+
+            dropbox_temp_root = st.text_input(
+                "Dropbox temp root folder",
+                value="/sku-generator-temp/active",
+                key="pipeline_dropbox_temp_root",
+                help="The app will create this folder automatically if it does not exist.",
+            )
+
+            overwrite_dropbox_temp = st.checkbox(
+                "Overwrite existing Dropbox temp files",
+                value=True,
+                key="pipeline_dropbox_overwrite",
+            )
+
+            if st.button("Upload Images to Dropbox Temp Hosting", key="pipeline_upload_dropbox_temp_btn"):
+                try:
+                    dbx = get_dropbox_client()
+                except Exception as exc:
+                    st.error(f"Could not connect to Dropbox: {exc}")
+                else:
+                    with st.status("Uploading ready design images to Dropbox...", expanded=True) as s:
+                        upload_report = upload_ready_design_to_dropbox_temp(
+                            dbx,
+                            selected_ready_sku,
+                            pipeline_root=pipeline_root,
+                            dropbox_root=dropbox_temp_root,
+                            expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                            overwrite=overwrite_dropbox_temp,
+                        )
+
+                        s.write(f"Dropbox folder: {upload_report.get('dropbox_folder')}")
+                        s.write(f"Uploaded: {upload_report.get('uploaded', 0)}")
+                        s.write(f"Linked: {upload_report.get('linked', 0)}")
+                        s.write(f"Failed: {upload_report.get('failed', 0)}")
+
+                        if upload_report.get("ready"):
+                            s.update(label="Dropbox temp hosting complete.")
+                            st.success("Images uploaded and linked. Design moved to active.")
+                        else:
+                            s.update(label="Dropbox temp hosting completed with issues.")
+                            st.warning("Dropbox hosting did not fully complete.")
+
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("SKU", upload_report.get("sku") or "Missing")
+                    col2.metric("Uploaded", upload_report.get("uploaded", 0))
+                    col3.metric("Linked", upload_report.get("linked", 0))
+
+                    st.write("Design folder:", upload_report.get("design_folder"))
+                    st.write("Dropbox folder:", upload_report.get("dropbox_folder"))
+                    st.write("Image links path:", upload_report.get("image_links_path"))
+
+                    issues = upload_report.get("issues", [])
+                    warnings = upload_report.get("warnings", [])
+
+                    if issues:
+                        st.error("Issues")
+                        for issue in issues:
+                            st.write(f"- {issue}")
+
+                    if warnings:
+                        st.warning("Warnings")
+                        for warning in warnings:
+                            st.write(f"- {warning}")
+
+                    image_links = upload_report.get("image_links", {})
+                    if image_links:
+                        st.write("First image links")
+                        sample_lines = [
+                            f"{key}: {value}"
+                            for key, value in list(image_links.items())[:5]
+                        ]
+                        st.code("\n".join(sample_lines))
+        else:
+            st.info("No ready designs available for Dropbox temp hosting.")
 
 
-    st.divider()
+        st.divider()
 
-    render_section_header("Active designs")
+        render_section_header("Active designs")
 
-    pipeline_scan_after_hosting = scan_pipeline_folders(
-        pipeline_root=pipeline_root,
-        expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
-    )
-    active_rows = pipeline_scan_after_hosting.get("active", [])
-
-    if active_rows:
-        st.dataframe(pd.DataFrame(active_rows), width="stretch")
-
-        active_skus = [row["SKU"] for row in active_rows]
-        selected_active_sku = st.selectbox(
-            "Select active design for CSV generation",
-            active_skus,
-            key="pipeline_csv_active_sku",
+        pipeline_scan_after_hosting = scan_pipeline_folders(
+            pipeline_root=pipeline_root,
+            expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
         )
+        active_rows = pipeline_scan_after_hosting.get("active", [])
 
-        active_folder_by_sku = {
-            row["SKU"]: row["Folder"]
-            for row in active_rows
-        }
+        if active_rows:
+            st.dataframe(pd.DataFrame(active_rows), width="stretch")
 
-        if st.button("Generate CSV from Active Design", key="pipeline_generate_csv_btn"):
-            try:
-                csv_result = _build_pipeline_csv_for_active_design(
-                    active_folder_by_sku[selected_active_sku],
-                    excluded_colors=excluded_colors,
-                )
-            except Exception as exc:
-                st.error(f"Could not generate CSV: {exc}")
-            else:
-                st.success("CSV generated successfully.")
-                st.metric("Rows", csv_result["rows"])
-                st.write("CSV path:", csv_result["csv_path"])
+            active_skus = [row["SKU"] for row in active_rows]
+            selected_active_sku = st.selectbox(
+                "Select active design for CSV generation",
+                active_skus,
+                key="pipeline_csv_active_sku",
+            )
 
-                csv_bytes = csv_result["df"].to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "Download Shopify CSV",
-                    data=csv_bytes,
-                    file_name=f"{csv_result['sku']}.csv",
-                    mime="text/csv",
-                    key="pipeline_download_generated_csv_btn",
-                )
+            active_folder_by_sku = {
+                row["SKU"]: row["Folder"]
+                for row in active_rows
+            }
 
-                with st.expander("Preview generated rows", expanded=False):
-                    st.dataframe(csv_result["df"].head(20), width="stretch")
-    else:
-        st.info("No active designs yet. Upload a ready design to Dropbox temp hosting first.")
+            if st.button("Generate CSV from Active Design", key="pipeline_generate_csv_btn"):
+                try:
+                    csv_result = _build_pipeline_csv_for_active_design(
+                        active_folder_by_sku[selected_active_sku],
+                        excluded_colors=excluded_colors,
+                        excluded_garments=excluded_garments,
+                    )
+                except Exception as exc:
+                    st.error(f"Could not generate CSV: {exc}")
+                else:
+                    st.success("CSV generated successfully.")
+                    st.metric("Rows", csv_result["rows"])
+                    st.write("CSV path:", csv_result["csv_path"])
+
+                    csv_bytes = csv_result["df"].to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        "Download Shopify CSV",
+                        data=csv_bytes,
+                        file_name=f"{csv_result['sku']}.csv",
+                        mime="text/csv",
+                        key="pipeline_download_generated_csv_btn",
+                    )
+
+                    with st.expander("Preview generated rows", expanded=False):
+                        st.dataframe(csv_result["df"].head(20), width="stretch")
+        else:
+            st.info("No active designs yet. Upload a ready design to Dropbox temp hosting first.")
 
 
 # =========================
 # Tab 2: Auto from Dropbox
 # =========================
 with tab_auto:
+    if LIVE_DEPLOYMENT_MODE:
+        render_section_header(
+            "Mockup ZIP intake",
+            "Complete Dropbox design folders, then download ready listings.",
+        )
+
+        mockup_source = "Dropbox"
+        if not DESIGNS_ROOT:
+            st.warning("Set `FOLDER_PATH_Design` in dpbox.env to your `/designs` root.")
+            st.stop()
+
+        dbx = get_dropbox_client()
+
+        cached_ready_folders = st.session_state.get("ready_folders", [])
+        cached_not_ready_folders = st.session_state.get("not_ready_folders", [])
+        if not cached_ready_folders and not cached_not_ready_folders:
+            st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
+                dbx, DESIGNS_ROOT, mockup_source=mockup_source
+            )
+
+        ready_folders = st.session_state.get("ready_folders", [])
+        not_ready_info = st.session_state.get("not_ready_folders", [])
+
+        with st.container(border=True):
+            render_section_header("Folder readiness")
+            live_deep_check_images = st.checkbox(
+                "Deep-check image files",
+                value=False,
+                key="live_deep_check_images",
+                help="Slower: downloads numbered Dropbox images to catch corrupt files.",
+            )
+            if st.button("Refresh folder analysis", key="live_refresh_folder_analysis_btn"):
+                st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
+                    dbx,
+                    DESIGNS_ROOT,
+                    mockup_source=mockup_source,
+                    validate_dropbox_images=live_deep_check_images,
+                )
+                ready_folders = st.session_state.get("ready_folders", [])
+                not_ready_info = st.session_state.get("not_ready_folders", [])
+
+            col_ready, col_not_ready = st.columns(2)
+            col_ready.metric("Ready folders", len(ready_folders))
+            col_not_ready.metric("Not ready", len(not_ready_info))
+
+            if not_ready_info:
+                st.markdown("#### Not ready folders")
+                st.data_editor(pd.DataFrame(not_ready_info), disabled=True, width="stretch")
+
+                st.markdown("#### Complete a not-ready folder")
+                not_ready_folder_names = [
+                    row["Folder"] for row in not_ready_info
+                    if row.get("Folder") and row.get("Folder") != "N/A"
+                ]
+                selected_not_ready_folder = st.selectbox(
+                    "Select folder to complete",
+                    not_ready_folder_names or [""],
+                    key="live_repair_not_ready_folder_select",
+                )
+                selected_not_ready_path = f"{DESIGNS_ROOT}/{selected_not_ready_folder}"
+                selected_note_files = _list_dropbox_note_files(dbx, selected_not_ready_path) if selected_not_ready_folder else []
+                selected_art_files = _list_design_art_files(dbx, selected_not_ready_path, selected_not_ready_folder) if selected_not_ready_folder else []
+
+                design_col, notes_col = st.columns([1.2, 1.4])
+                with design_col:
+                    st.markdown("##### Design")
+                    if selected_art_files:
+                        st.metric("Files", len(selected_art_files))
+                        for selected_art_file in selected_art_files:
+                            art_path = f"{selected_not_ready_path}/{selected_art_file.name}"
+                            try:
+                                art_bytes = _download_dropbox_file_bytes(dbx, art_path)
+                                st.image(art_bytes, caption=selected_art_file.name, width="stretch")
+                                art_ext = os.path.splitext(selected_art_file.name)[1].lower().lstrip(".")
+                                art_mime = f"image/{'jpeg' if art_ext == 'jpg' else art_ext or 'png'}"
+                                st.download_button(
+                                    f"Download {selected_art_file.name}",
+                                    data=art_bytes,
+                                    file_name=selected_art_file.name,
+                                    mime=art_mime,
+                                    key=f"live_download_art_{selected_not_ready_folder}_{selected_art_file.name}",
+                                )
+                            except Exception as exc:
+                                st.warning(f"Could not preview {selected_art_file.name}: {exc}")
+                    else:
+                        st.caption("No design image found.")
+
+                with notes_col:
+                    st.markdown("##### Notes")
+                    st.metric("Files", len(selected_note_files))
+                    if selected_note_files:
+                        for note_index, note_file in enumerate(selected_note_files, start=1):
+                            note_path = f"{selected_not_ready_path}/{note_file.name}"
+                            try:
+                                note_bytes = _download_dropbox_file_bytes(dbx, note_path)
+                            except Exception as exc:
+                                st.warning(f"Could not read {note_file.name}: {exc}")
+                                continue
+
+                            note_mime = "application/pdf" if note_file.name.lower().endswith(".pdf") else "text/plain"
+                            st.download_button(
+                                f"Download {note_file.name}",
+                                data=note_bytes,
+                                file_name=note_file.name,
+                                mime=note_mime,
+                                key=f"live_repair_note_download_{note_index}_{note_file.name}",
+                            )
+                            if note_file.name.lower().endswith(".txt"):
+                                with st.expander(f"Read {note_file.name}", expanded=False):
+                                    st.text(_decode_note_text(note_bytes))
+                    else:
+                        st.caption("No notes found in the selected folder.")
+
+                repair_col1, repair_col2 = st.columns(2)
+                with repair_col1:
+                    repair_metadata_json = st.file_uploader(
+                        "Metadata JSON for selected folder",
+                        type=["json"],
+                        key="live_repair_not_ready_metadata_json",
+                    )
+                with repair_col2:
+                    repair_mockup_zip = st.file_uploader(
+                        "Mockup ZIP for selected folder",
+                        type=["zip"],
+                        key="live_repair_not_ready_mockup_zip",
+                    )
+
+                repair_overwrite_metadata = st.checkbox(
+                    "Overwrite selected folder metadata JSON",
+                    value=True,
+                    key="live_repair_not_ready_overwrite_metadata",
+                )
+                repair_overwrite_mockups = st.checkbox(
+                    "Overwrite selected folder numbered images",
+                    value=True,
+                    key="live_repair_not_ready_overwrite_mockups",
+                )
+
+                repair_preview_rows = []
+                repair_metadata = None
+                repair_metadata_blocked = False
+                if repair_metadata_json is not None:
+                    try:
+                        repair_metadata = load_metadata_json(repair_metadata_json)
+                        metadata_errors, descriptions_count_label = _metadata_issues(repair_metadata)
+                        repair_preview_rows.append({
+                            "File": getattr(repair_metadata_json, "name", "metadata.json"),
+                            "Type": "Metadata JSON",
+                            "Detected SKU": _normalise_sku(repair_metadata.get("sku_suffix")),
+                            "Count": descriptions_count_label,
+                            "Status": "Blocked" if metadata_errors else "Ready",
+                            "Issues": "; ".join(metadata_errors),
+                        })
+                        repair_metadata_blocked = bool(metadata_errors)
+                    except Exception as exc:
+                        repair_preview_rows.append({
+                            "File": getattr(repair_metadata_json, "name", "metadata.json"),
+                            "Type": "Metadata JSON",
+                            "Detected SKU": "",
+                            "Count": "",
+                            "Status": "Blocked",
+                            "Issues": str(exc),
+                        })
+                        repair_metadata_blocked = True
+
+                repair_images = None
+                repair_zip_blocked = False
+                if repair_mockup_zip is not None:
+                    inspection = inspect_mockup_zip(
+                        repair_mockup_zip,
+                        expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                    )
+                    zip_errors = [
+                        error for error in inspection["errors"]
+                        if "Could not detect SKU from ZIP filename" not in error
+                    ]
+                    zip_warnings = list(inspection["warnings"])
+                    try:
+                        repair_images = extract_mockup_images(repair_mockup_zip)
+                    except Exception:
+                        repair_images = None
+                    repair_preview_rows.append({
+                        "File": inspection["filename"],
+                        "Type": "Mockup ZIP",
+                        "Detected SKU": inspection["sku"],
+                        "Count": f"{inspection['images_found']} / {MOCKUP_ZIP_EXPECTED_IMAGES}",
+                        "Status": "Blocked" if zip_errors else "Ready with warnings" if zip_warnings else "Ready",
+                        "Issues": "; ".join(zip_errors + zip_warnings),
+                    })
+                    repair_zip_blocked = bool(zip_errors)
+
+                if repair_preview_rows:
+                    st.data_editor(
+                        pd.DataFrame(repair_preview_rows),
+                        disabled=True,
+                        width="stretch",
+                        key="live_repair_not_ready_preview_table",
+                    )
+
+                repair_disabled = (
+                    not selected_not_ready_folder
+                    or (repair_metadata_json is None and repair_mockup_zip is None)
+                    or repair_metadata_blocked
+                    or repair_zip_blocked
+                )
+                if st.button(
+                    "Add files to selected folder",
+                    disabled=repair_disabled,
+                    key="live_repair_not_ready_upload_btn",
+                ):
+                    upload_rows = []
+                    with st.status(f"Updating {selected_not_ready_folder}...", expanded=True) as s:
+                        if repair_metadata is not None:
+                            metadata_result = _upload_metadata_json_to_dropbox(
+                                dbx,
+                                selected_not_ready_path,
+                                repair_metadata,
+                                overwrite=repair_overwrite_metadata,
+                            )
+                            metadata_status = (
+                                f"Failed: {metadata_result['error']}"
+                                if metadata_result["error"]
+                                else "Skipped existing"
+                                if metadata_result["skipped"]
+                                else "Uploaded"
+                            )
+                            upload_rows.append({"Item": "Metadata JSON", "Uploaded": metadata_status})
+                            s.write(f"Metadata JSON: {metadata_status}")
+
+                        if repair_images is not None:
+                            image_result = upload_mockup_images_to_dropbox(
+                                dbx,
+                                selected_not_ready_path,
+                                repair_images,
+                                overwrite=repair_overwrite_mockups,
+                                expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                            )
+                            upload_rows.append({
+                                "Item": "Mockup ZIP",
+                                "Uploaded": image_result["uploaded"],
+                                "Skipped": image_result["skipped"],
+                                "Failed": image_result["failed"],
+                                "Truncated": image_result["truncated"],
+                                "Details": "; ".join(
+                                    f"{item['target']}: {item['error']}"
+                                    for item in image_result.get("failed_files", [])[:5]
+                                ),
+                            })
+                            s.write(
+                                f"Mockups: uploaded {image_result['uploaded']}, "
+                                f"skipped {image_result['skipped']}, failed {image_result['failed']}."
+                            )
+
+                        st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
+                            dbx, DESIGNS_ROOT, mockup_source=mockup_source
+                        )
+                        ready_folders = st.session_state.get("ready_folders", [])
+                        not_ready_info = st.session_state.get("not_ready_folders", [])
+                        s.update(label="Folder updated. Readiness refreshed.")
+
+                    st.dataframe(pd.DataFrame(upload_rows), width="stretch")
+            else:
+                st.success("All folders are ready.")
+
+        with st.container(border=True):
+            render_section_header("Bulk ZIP and JSON upload")
+            st.caption("Upload files named after the Dropbox folder, for example `BBRPWLULE.zip` and `BBRPWLULE.json`.")
+            mpn_bulk_zip_uploads = st.file_uploader(
+                "Upload MPN-named ZIP files",
+                type=["zip"],
+                accept_multiple_files=True,
+                key="live_mpn_mockup_zip_uploader",
+            )
+            mpn_bulk_json_uploads = st.file_uploader(
+                "Upload MPN-named JSON files",
+                type=["json"],
+                accept_multiple_files=True,
+                key="live_mpn_metadata_json_uploader",
+            )
+            mpn_overwrite_mockups = st.checkbox(
+                "Overwrite existing numbered images",
+                value=False,
+                key="live_mpn_mockup_zip_overwrite",
+            )
+            mpn_overwrite_metadata_json = st.checkbox(
+                "Overwrite existing metadata JSON",
+                value=True,
+                key="live_mpn_metadata_json_overwrite",
+            )
+
+            mpn_zip_map = {}
+            mpn_json_map = {}
+            mpn_duplicate_warnings = []
+            for uploaded_zip in mpn_bulk_zip_uploads or []:
+                mpn = _uploaded_file_stem(uploaded_zip)
+                normalised_mpn = _normalise_sku(mpn)
+                if not normalised_mpn:
+                    mpn_duplicate_warnings.append(f"{getattr(uploaded_zip, 'name', 'ZIP')}: missing MPN filename.")
+                elif normalised_mpn in mpn_zip_map:
+                    mpn_duplicate_warnings.append(f"Duplicate ZIP for MPN {mpn}.")
+                else:
+                    mpn_zip_map[normalised_mpn] = {"mpn": mpn, "file": uploaded_zip}
+
+            for uploaded_json in mpn_bulk_json_uploads or []:
+                mpn = _uploaded_file_stem(uploaded_json)
+                normalised_mpn = _normalise_sku(mpn)
+                if not normalised_mpn:
+                    mpn_duplicate_warnings.append(f"{getattr(uploaded_json, 'name', 'JSON')}: missing MPN filename.")
+                elif normalised_mpn in mpn_json_map:
+                    mpn_duplicate_warnings.append(f"Duplicate JSON for MPN {mpn}.")
+                else:
+                    mpn_json_map[normalised_mpn] = {"mpn": mpn, "file": uploaded_json}
+
+            if mpn_duplicate_warnings:
+                st.warning(" ".join(mpn_duplicate_warnings))
+
+            mpn_bulk_rows = []
+            for normalised_mpn in sorted(set(mpn_zip_map) | set(mpn_json_map)):
+                zip_entry = mpn_zip_map.get(normalised_mpn)
+                json_entry = mpn_json_map.get(normalised_mpn)
+                mpn = (zip_entry or json_entry)["mpn"]
+                target_folder_path = f"{DESIGNS_ROOT}/{mpn}"
+                target_exists = _dbx_exists(dbx, target_folder_path)
+                errors = []
+                warnings = []
+                metadata = None
+                json_sku = ""
+                zip_images_found = "No ZIP"
+
+                if not target_exists:
+                    errors.append(f"Target folder not found: {target_folder_path}")
+
+                if zip_entry:
+                    inspection = inspect_mockup_zip(
+                        zip_entry["file"],
+                        expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                    )
+                    zip_images_found = f"{inspection['images_found']} / {MOCKUP_ZIP_EXPECTED_IMAGES}"
+                    errors.extend(
+                        error for error in inspection["errors"]
+                        if "Could not detect SKU from ZIP filename" not in error
+                    )
+                    warnings.extend(inspection["warnings"])
+
+                if json_entry:
+                    try:
+                        metadata = load_metadata_json(json_entry["file"])
+                        json_sku = str(metadata.get("sku_suffix", "") or "")
+                        metadata_errors, _ = _metadata_issues(metadata)
+                        errors.extend(metadata_errors)
+                        if json_sku and _normalise_sku(json_sku) != normalised_mpn:
+                            warnings.append(f"JSON sku_suffix is {json_sku}; target folder is {mpn}.")
+                    except Exception as exc:
+                        errors.append(f"JSON error: {exc}")
+
+                mpn_bulk_rows.append({
+                    "MPN": mpn,
+                    "Target folder exists": target_exists,
+                    "ZIP file": getattr(zip_entry["file"], "name", "") if zip_entry else "",
+                    "Images found": zip_images_found,
+                    "JSON file": getattr(json_entry["file"], "name", "") if json_entry else "",
+                    "JSON SKU": json_sku,
+                    "Status": "Blocked" if errors else "Ready with warnings" if warnings else "Ready",
+                    "Issues": "; ".join(errors),
+                    "Warnings": "; ".join(warnings),
+                    "_target_folder_path": target_folder_path,
+                    "_zip_file": zip_entry["file"] if zip_entry else None,
+                    "_metadata": metadata,
+                    "_blocked": bool(errors),
+                })
+
+            if mpn_bulk_rows:
+                st.data_editor(
+                    pd.DataFrame([
+                        {key: value for key, value in row.items() if not key.startswith("_")}
+                        for row in mpn_bulk_rows
+                    ]),
+                    disabled=True,
+                    width="stretch",
+                    key="live_mpn_bulk_preview_table",
+                )
+
+            if st.button(
+                "Upload ZIP and JSON to Dropbox",
+                disabled=not mpn_bulk_rows,
+                key="live_mpn_bulk_upload_btn",
+            ):
+                successful_upload = False
+                upload_rows = []
+                with st.status("Uploading ZIP and JSON files to Dropbox...", expanded=True) as s:
+                    for row in mpn_bulk_rows:
+                        mpn = row["MPN"]
+                        if row["_blocked"]:
+                            s.write(f"{mpn}: blocked - {row['Issues']}")
+                            upload_rows.append({
+                                "MPN": mpn,
+                                "Metadata": "Blocked",
+                                "Uploaded": 0,
+                                "Skipped": 0,
+                                "Failed": 0,
+                                "Truncated": 0,
+                                "Status": "Blocked",
+                                "Details": row["Issues"],
+                            })
+                            continue
+
+                        metadata_status = "No change"
+                        image_result = {"uploaded": 0, "skipped": 0, "failed": 0, "truncated": 0, "failed_files": []}
+                        try:
+                            if row.get("_metadata"):
+                                metadata_result = _upload_metadata_json_to_dropbox(
+                                    dbx,
+                                    row["_target_folder_path"],
+                                    row["_metadata"],
+                                    overwrite=mpn_overwrite_metadata_json,
+                                )
+                                if metadata_result["error"]:
+                                    metadata_status = f"Failed: {metadata_result['error']}"
+                                elif metadata_result["skipped"]:
+                                    metadata_status = "Skipped existing"
+                                else:
+                                    metadata_status = "Uploaded"
+
+                            if row.get("_zip_file"):
+                                images = extract_mockup_images(row["_zip_file"])
+                                image_result = upload_mockup_images_to_dropbox(
+                                    dbx,
+                                    row["_target_folder_path"],
+                                    images,
+                                    overwrite=mpn_overwrite_mockups,
+                                    expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                                )
+
+                            successful_upload = (
+                                successful_upload
+                                or image_result["uploaded"] > 0
+                                or metadata_status == "Uploaded"
+                            )
+                            upload_rows.append({
+                                "MPN": mpn,
+                                "Metadata": metadata_status,
+                                "Uploaded": image_result["uploaded"],
+                                "Skipped": image_result["skipped"],
+                                "Failed": image_result["failed"],
+                                "Truncated": image_result["truncated"],
+                                "Details": "; ".join(
+                                    f"{item['target']}: {item['error']}"
+                                    for item in image_result.get("failed_files", [])[:5]
+                                ),
+                                "Status": (
+                                    "Completed with failures"
+                                    if image_result["failed"] or metadata_status.startswith("Failed:")
+                                    else "Done"
+                                ),
+                            })
+                            s.write(
+                                f"{mpn}: metadata {metadata_status.lower()}, uploaded {image_result['uploaded']}, "
+                                f"skipped {image_result['skipped']}, failed {image_result['failed']}."
+                            )
+                        except Exception as exc:
+                            upload_rows.append({
+                                "MPN": mpn,
+                                "Metadata": metadata_status,
+                                "Uploaded": image_result["uploaded"],
+                                "Skipped": image_result["skipped"],
+                                "Failed": image_result["failed"] + 1,
+                                "Truncated": image_result["truncated"],
+                                "Status": str(exc),
+                                "Details": "",
+                            })
+                            s.write(f"{mpn}: failed - {exc}")
+
+                    if successful_upload:
+                        st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
+                            dbx, DESIGNS_ROOT, mockup_source=mockup_source
+                        )
+                        ready_folders = st.session_state.get("ready_folders", [])
+                        not_ready_info = st.session_state.get("not_ready_folders", [])
+                        s.update(label="ZIP and JSON upload complete. Folder analysis refreshed.")
+                    else:
+                        s.update(label="ZIP and JSON upload finished. No new files were uploaded.")
+
+                st.dataframe(pd.DataFrame(upload_rows), width="stretch")
+
+        with st.container(border=True):
+            render_section_header("Download ready listings")
+            if ready_folders:
+                st.dataframe(pd.DataFrame({"Ready folders": ready_folders}), width="stretch")
+                download_targets = st.multiselect(
+                    "Ready folders to include",
+                    options=ready_folders,
+                    default=ready_folders,
+                    key="live_download_targets",
+                )
+            else:
+                download_targets = []
+                st.info("No ready folders available yet.")
+
+            download_mode = st.radio(
+                "Download mode",
+                ["One combined CSV", "Batch CSV parts"],
+                horizontal=True,
+                key="live_download_mode",
+            )
+            build_download_disabled = not download_targets
+            if st.button(
+                "Build download files",
+                disabled=build_download_disabled,
+                key="live_build_download_files_btn",
+            ):
+                build_start = time.perf_counter()
+                st.session_state.batch_validation = None
+                st.session_state.pop("live_listing_csv_files", None)
+                dfs = []
+                failed_builds = []
+                validation_parts = []
+
+                with st.status("Building ready listing CSV files...", expanded=True) as s:
+                    for fname in download_targets:
+                        try:
+                            meta_i = download_metadata(dbx, f"{DESIGNS_ROOT}/{fname}")
+                            metadata_validation = _validate_metadata_for_listing(meta_i, label=fname)
+                            validation_parts.append(metadata_validation)
+                            if has_validation_errors(metadata_validation):
+                                failed_builds.append((fname, _format_validation_errors(metadata_validation)))
+                                continue
+
+                            df_i, _, missing = build_design_dataframe(
+                                dbx,
+                                fname,
+                                excluded_colors=excluded_colors,
+                                excluded_garments=excluded_garments,
+                                mockup_source=mockup_source,
+                                metadata=meta_i,
+                            )
+                            if missing:
+                                s.write(f"{fname}: missing image links {missing[:10]}{'...' if len(missing) > 10 else ''}")
+                            validation_parts.append(validate_shopify_dataframe(df_i, label=fname))
+                            dfs.append(df_i)
+                            s.write(f"{fname}: ready")
+                        except Exception as exc:
+                            failed_builds.append((fname, str(exc)))
+                            s.write(f"{fname}: failed - {exc}")
+
+                    combined_validation = combine_validation_results(*validation_parts) if validation_parts else None
+                    st.session_state.batch_validation = combined_validation
+
+                    if combined_validation and has_validation_errors(combined_validation):
+                        s.update(label="CSV build blocked by listing safety errors.")
+                    elif not dfs:
+                        s.update(label="No CSV files were built.")
+                    else:
+                        all_df = pd.concat(dfs, ignore_index=True)
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        if download_mode == "One combined CSV":
+                            csv_bytes = all_df.to_csv(index=False).encode("utf-8-sig")
+                            files = [(f"READY_LISTINGS_{ts}.csv", csv_bytes)]
+                        else:
+                            chunks = _split_df_by_limits(all_df)
+                            files = [
+                                (f"READY_LISTINGS_{ts}_part{i}.csv", cdf.to_csv(index=False).encode("utf-8-sig"))
+                                for i, cdf in enumerate(chunks, start=1)
+                            ]
+                        _stash_downloads("live_listing_csv_files", files)
+                        s.update(label=f"Built {len(files)} download file(s).")
+
+                for fname, reason in failed_builds:
+                    st.warning(f"{fname}: {reason}")
+                st.info(f"CSV build finished in {fmt_secs(time.perf_counter() - build_start)}")
+
+            if st.session_state.get("live_listing_csv_files"):
+                _render_downloads("live_listing_csv_files", "Ready listing CSV file(s)", zip_name_prefix="READY_LISTINGS")
+            else:
+                st.caption("Build download files first.")
+
+            if st.session_state.get("batch_validation"):
+                _render_listing_safety_checks(st.session_state.batch_validation)
+
+        with st.container(border=True):
+            render_section_header("Finish processed folders")
+            if ready_folders:
+                finish_targets = st.multiselect(
+                    "Ready folders to finish",
+                    options=ready_folders,
+                    default=ready_folders,
+                    key="live_finish_targets",
+                )
+            else:
+                finish_targets = []
+                st.caption("No ready folders available to finish.")
+
+            finish_disabled = not finish_targets
+            finish_col1, finish_col2 = st.columns(2)
+            if finish_col1.button(
+                "Move selected to /finished",
+                disabled=finish_disabled,
+                key="live_move_finished_btn",
+            ):
+                with st.status("Moving selected folders to /finished...", expanded=True) as s:
+                    ok = 0
+                    for fname in finish_targets:
+                        try:
+                            dest = move_selected_to_finished(dbx, fname)
+                            s.write(f"{fname}: moved to {dest}")
+                            ok += 1
+                        except Exception as exc:
+                            s.write(f"{fname}: failed - {exc}")
+                    st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
+                        dbx, DESIGNS_ROOT, mockup_source=mockup_source
+                    )
+                    s.update(label=f"Done. {ok}/{len(finish_targets)} moved.")
+
+            if finish_col2.button(
+                "Delete numbered images and archive",
+                disabled=finish_disabled,
+                key="live_clean_archive_btn",
+            ):
+                with st.status("Deleting numbered images and archiving selected folders...", expanded=True) as s:
+                    ok = 0
+                    for fname in finish_targets:
+                        try:
+                            deleted, dest = clean_and_archive_to_completed(dbx, fname)
+                            s.write(f"{fname}: deleted {deleted} numbered images and archived to {dest}")
+                            ok += 1
+                        except Exception as exc:
+                            s.write(f"{fname}: failed - {exc}")
+                    st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
+                        dbx, DESIGNS_ROOT, mockup_source=mockup_source
+                    )
+                    s.update(label=f"Done. {ok}/{len(finish_targets)} archived.")
+
+        st.stop()
+
     render_section_header(
         "Auto from Dropbox",
         "Build Shopify CSVs from ready design folders, then download or upload after safety checks pass.",
@@ -1557,6 +2464,222 @@ with tab_auto:
                 st.markdown("#### Not ready folders")
                 df_not_ready = pd.DataFrame(not_ready_info)
                 st.data_editor(df_not_ready, disabled=True, width="stretch")
+
+                st.markdown("#### Complete a not-ready folder")
+                not_ready_folder_names = [row["Folder"] for row in not_ready_info if row.get("Folder") and row.get("Folder") != "N/A"]
+                selected_not_ready_folder = st.selectbox(
+                    "Select folder to complete",
+                    not_ready_folder_names or [""],
+                    key="repair_not_ready_folder_select",
+                )
+                if not not_ready_folder_names:
+                    st.caption("No selectable not-ready folders found.")
+                selected_not_ready_path = f"{DESIGNS_ROOT}/{selected_not_ready_folder}"
+                selected_note_files = _list_dropbox_note_files(dbx, selected_not_ready_path) if selected_not_ready_folder else []
+                selected_art_files = _list_design_art_files(dbx, selected_not_ready_path, selected_not_ready_folder) if selected_not_ready_folder else []
+
+                design_col, notes_col = st.columns([1.2, 1.4])
+                with design_col:
+                    st.markdown("##### Design")
+                    if selected_art_files:
+                        st.metric("Files", len(selected_art_files))
+                        for selected_art_file in selected_art_files:
+                            art_path = f"{selected_not_ready_path}/{selected_art_file.name}"
+                            try:
+                                art_bytes = _download_dropbox_file_bytes(dbx, art_path)
+                                st.image(art_bytes, caption=selected_art_file.name, width="stretch")
+                                art_ext = os.path.splitext(selected_art_file.name)[1].lower().lstrip(".")
+                                art_mime = f"image/{'jpeg' if art_ext == 'jpg' else art_ext or 'png'}"
+                                st.download_button(
+                                    f"Download {selected_art_file.name}",
+                                    data=art_bytes,
+                                    file_name=selected_art_file.name,
+                                    mime=art_mime,
+                                    key=f"download_art_{selected_not_ready_folder}_{selected_art_file.name}",
+                                )
+                            except Exception as exc:
+                                st.warning(f"Could not preview {selected_art_file.name}: {exc}")
+                    else:
+                        st.caption("No design image found.")
+
+                with notes_col:
+                    st.markdown("##### Notes")
+                    st.metric("Files", len(selected_note_files))
+                    if selected_note_files:
+                        for note_index, note_file in enumerate(selected_note_files, start=1):
+                            note_path = f"{selected_not_ready_path}/{note_file.name}"
+                            try:
+                                note_bytes = _download_dropbox_file_bytes(dbx, note_path)
+                            except Exception as exc:
+                                st.warning(f"Could not read {note_file.name}: {exc}")
+                                continue
+
+                            note_mime = "application/pdf" if note_file.name.lower().endswith(".pdf") else "text/plain"
+                            st.download_button(
+                                f"Download {note_file.name}",
+                                data=note_bytes,
+                                file_name=note_file.name,
+                                mime=note_mime,
+                                key=f"repair_not_ready_note_download_{note_index}_{note_file.name}",
+                            )
+
+                            if note_file.name.lower().endswith(".txt"):
+                                with st.expander(f"Read {note_file.name}", expanded=False):
+                                    st.text(_decode_note_text(note_bytes))
+                    else:
+                        st.caption("No notes found in the selected folder.")
+
+                repair_col1, repair_col2 = st.columns(2)
+                with repair_col1:
+                    repair_metadata_json = st.file_uploader(
+                        "Metadata JSON for selected folder",
+                        type=["json"],
+                        key="repair_not_ready_metadata_json",
+                    )
+                with repair_col2:
+                    repair_mockup_zip = st.file_uploader(
+                        "Mockup ZIP for selected folder",
+                        type=["zip"],
+                        key="repair_not_ready_mockup_zip",
+                    )
+
+                repair_overwrite_metadata = st.checkbox(
+                    "Overwrite selected folder metadata JSON",
+                    value=True,
+                    key="repair_not_ready_overwrite_metadata",
+                )
+                repair_overwrite_mockups = st.checkbox(
+                    "Overwrite selected folder numbered images",
+                    value=True,
+                    key="repair_not_ready_overwrite_mockups",
+                )
+
+                repair_preview_rows = []
+                repair_metadata = None
+                repair_metadata_blocked = False
+                if repair_metadata_json is not None:
+                    try:
+                        repair_metadata = load_metadata_json(repair_metadata_json)
+                        metadata_errors, descriptions_count_label = _metadata_issues(repair_metadata)
+                        repair_preview_rows.append({
+                            "File": getattr(repair_metadata_json, "name", "metadata.json"),
+                            "Type": "Metadata JSON",
+                            "Detected SKU": _normalise_sku(repair_metadata.get("sku_suffix")),
+                            "Count": descriptions_count_label,
+                            "Status": "Blocked" if metadata_errors else "Ready",
+                            "Issues": "; ".join(metadata_errors),
+                        })
+                        repair_metadata_blocked = bool(metadata_errors)
+                    except Exception as exc:
+                        repair_preview_rows.append({
+                            "File": getattr(repair_metadata_json, "name", "metadata.json"),
+                            "Type": "Metadata JSON",
+                            "Detected SKU": "",
+                            "Count": "",
+                            "Status": "Blocked",
+                            "Issues": str(exc),
+                        })
+                        repair_metadata_blocked = True
+
+                repair_images = None
+                repair_zip_blocked = False
+                if repair_mockup_zip is not None:
+                    inspection = inspect_mockup_zip(
+                        repair_mockup_zip,
+                        expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                    )
+                    zip_errors = [
+                        error for error in inspection["errors"]
+                        if "Could not detect SKU from ZIP filename" not in error
+                    ]
+                    zip_warnings = list(inspection["warnings"])
+                    try:
+                        repair_images = extract_mockup_images(repair_mockup_zip)
+                    except Exception:
+                        repair_images = None
+                    repair_preview_rows.append({
+                        "File": inspection["filename"],
+                        "Type": "Mockup ZIP",
+                        "Detected SKU": inspection["sku"],
+                        "Count": f"{inspection['images_found']} / {MOCKUP_ZIP_EXPECTED_IMAGES}",
+                        "Status": "Blocked" if zip_errors else "Ready with warnings" if zip_warnings else "Ready",
+                        "Issues": "; ".join(zip_errors + zip_warnings),
+                    })
+                    repair_zip_blocked = bool(zip_errors)
+
+                if repair_preview_rows:
+                    st.data_editor(
+                        pd.DataFrame(repair_preview_rows),
+                        disabled=True,
+                        width="stretch",
+                        key="repair_not_ready_preview_table",
+                    )
+
+                repair_disabled = (
+                    not selected_not_ready_folder
+                    or (repair_metadata_json is None and repair_mockup_zip is None)
+                    or repair_metadata_blocked
+                    or repair_zip_blocked
+                )
+                if st.button(
+                    "Add files to selected folder",
+                    disabled=repair_disabled,
+                    key="repair_not_ready_upload_btn",
+                ):
+                    upload_rows = []
+                    with st.status(f"Updating {selected_not_ready_folder}...", expanded=True) as s:
+                        if repair_metadata is not None:
+                            metadata_result = _upload_metadata_json_to_dropbox(
+                                dbx,
+                                selected_not_ready_path,
+                                repair_metadata,
+                                overwrite=repair_overwrite_metadata,
+                            )
+                            metadata_status = (
+                                f"Failed: {metadata_result['error']}"
+                                if metadata_result["error"]
+                                else "Skipped existing"
+                                if metadata_result["skipped"]
+                                else "Uploaded"
+                            )
+                            upload_rows.append({
+                                "Item": "Metadata JSON",
+                                "Uploaded": metadata_status,
+                            })
+                            s.write(f"Metadata JSON: {metadata_status}")
+
+                        if repair_images is not None:
+                            image_result = upload_mockup_images_to_dropbox(
+                                dbx,
+                                selected_not_ready_path,
+                                repair_images,
+                                overwrite=repair_overwrite_mockups,
+                                expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
+                            )
+                            upload_rows.append({
+                                "Item": "Mockup ZIP",
+                                "Uploaded": image_result["uploaded"],
+                                "Skipped": image_result["skipped"],
+                                "Failed": image_result["failed"],
+                                "Truncated": image_result["truncated"],
+                                "Details": "; ".join(
+                                    f"{item['target']}: {item['error']}"
+                                    for item in image_result.get("failed_files", [])[:5]
+                                ),
+                            })
+                            s.write(
+                                f"Mockups: uploaded {image_result['uploaded']}, "
+                                f"skipped {image_result['skipped']}, failed {image_result['failed']}."
+                            )
+
+                        st.session_state.ready_folders, st.session_state.not_ready_folders = analyze_design_folders(
+                            dbx, DESIGNS_ROOT, mockup_source=mockup_source
+                        )
+                        ready_folders = st.session_state.get("ready_folders", [])
+                        not_ready_info = st.session_state.get("not_ready_folders", [])
+                        s.update(label="Folder updated. Readiness refreshed.")
+
+                    st.dataframe(pd.DataFrame(upload_rows), width="stretch")
             else:
                 st.success("All folders are ready.")
 
@@ -1568,13 +2691,35 @@ with tab_auto:
                 accept_multiple_files=True,
                 key="mockup_zip_uploader",
             )
+            uploaded_metadata_jsons = st.file_uploader(
+                "Upload metadata JSON",
+                type=["json"],
+                accept_multiple_files=True,
+                key="mockup_metadata_json_uploader",
+                help="Optional. JSON files are matched to ZIPs by sku_suffix.",
+            )
             overwrite_mockups = st.checkbox(
                 "Overwrite existing numbered images",
                 value=False,
                 key="mockup_zip_overwrite",
             )
+            overwrite_metadata_json = st.checkbox(
+                "Overwrite existing metadata JSON",
+                value=True,
+                key="mockup_metadata_json_overwrite",
+            )
 
             zip_previews = []
+            metadata_by_sku, metadata_preview_rows = _metadata_index_from_uploads(uploaded_metadata_jsons)
+            if metadata_preview_rows:
+                st.markdown("#### Metadata JSON preview")
+                st.data_editor(
+                    pd.DataFrame(metadata_preview_rows),
+                    disabled=True,
+                    width="stretch",
+                    key="mockup_metadata_json_preview_table",
+                )
+
             if uploaded_zips:
                 for uploaded_zip in uploaded_zips:
                     inspection = inspect_mockup_zip(
@@ -1582,15 +2727,24 @@ with tab_auto:
                         expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
                     )
                     sku = inspection["sku"]
+                    normalised_sku = _normalise_sku(sku)
                     target_folder_path = f"{DESIGNS_ROOT}/{sku}" if sku else ""
                     target_exists = bool(target_folder_path and _dbx_exists(dbx, target_folder_path))
                     metadata_exists = bool(target_exists and _dropbox_folder_has_metadata(dbx, target_folder_path))
+                    matched_metadata = metadata_by_sku.get(normalised_sku)
+                    metadata_status = (
+                        "Will upload"
+                        if matched_metadata
+                        else "Already exists"
+                        if metadata_exists
+                        else "Missing"
+                    )
 
                     errors = list(inspection["errors"])
                     warnings = list(inspection["warnings"])
                     if sku and not target_exists:
                         errors.append(f"Target folder not found: {target_folder_path}")
-                    if target_exists and not metadata_exists:
+                    if target_exists and not metadata_exists and not matched_metadata:
                         errors.append("Metadata JSON is missing in target folder.")
 
                     status = "Blocked" if errors else "Ready with warnings" if warnings else "Ready"
@@ -1598,13 +2752,14 @@ with tab_auto:
                         "ZIP file": inspection["filename"],
                         "Detected SKU": sku,
                         "Target folder exists": target_exists,
-                        "Metadata exists": metadata_exists,
+                        "Metadata": metadata_status,
                         "Images found": inspection["images_found"],
                         "Status": status,
                         "Errors": "; ".join(errors),
                         "Warnings": "; ".join(warnings),
                         "_uploaded_file": uploaded_zip,
                         "_target_folder_path": target_folder_path,
+                        "_metadata": matched_metadata["metadata"] if matched_metadata else None,
                         "_blocked": bool(errors),
                     })
 
@@ -1619,19 +2774,20 @@ with tab_auto:
                     key="mockup_zip_preview_table",
                 )
 
-            if st.button("Upload mockups to Dropbox", disabled=not uploaded_zips, key="mockup_zip_upload_btn"):
+            if st.button("Upload ZIP and JSON to Dropbox", disabled=not uploaded_zips, key="mockup_zip_upload_btn"):
                 if not zip_previews:
                     st.warning("Upload at least one ZIP file first.")
                 else:
                     successful_upload = False
                     upload_rows = []
-                    with st.status("Uploading mockups to Dropbox...", expanded=True) as s:
+                    with st.status("Uploading ZIP and JSON files to Dropbox...", expanded=True) as s:
                         for row in zip_previews:
                             zip_name = row["ZIP file"]
                             if row["_blocked"]:
                                 s.write(f"{zip_name}: blocked - {row['Errors']}")
                                 upload_rows.append({
                                     "ZIP file": zip_name,
+                                    "Metadata": "Blocked",
                                     "Uploaded": 0,
                                     "Skipped": 0,
                                     "Failed": 0,
@@ -1642,6 +2798,21 @@ with tab_auto:
 
                             try:
                                 images = extract_mockup_images(row["_uploaded_file"])
+                                metadata_status = "No change"
+                                if row.get("_metadata"):
+                                    metadata_result = _upload_metadata_json_to_dropbox(
+                                        dbx,
+                                        row["_target_folder_path"],
+                                        row["_metadata"],
+                                        overwrite=overwrite_metadata_json,
+                                    )
+                                    if metadata_result["error"]:
+                                        metadata_status = f"Failed: {metadata_result['error']}"
+                                    elif metadata_result["skipped"]:
+                                        metadata_status = "Skipped existing"
+                                    else:
+                                        metadata_status = "Uploaded"
+
                                 result = upload_mockup_images_to_dropbox(
                                     dbx,
                                     row["_target_folder_path"],
@@ -1649,22 +2820,32 @@ with tab_auto:
                                     overwrite=overwrite_mockups,
                                     expected_count=MOCKUP_ZIP_EXPECTED_IMAGES,
                                 )
-                                successful_upload = successful_upload or result["uploaded"] > 0
+                                successful_upload = successful_upload or result["uploaded"] > 0 or metadata_status == "Uploaded"
                                 upload_rows.append({
                                     "ZIP file": zip_name,
+                                    "Metadata": metadata_status,
                                     "Uploaded": result["uploaded"],
                                     "Skipped": result["skipped"],
                                     "Failed": result["failed"],
                                     "Truncated": result["truncated"],
-                                    "Status": "Done" if result["failed"] == 0 else "Completed with failures",
+                                    "Details": "; ".join(
+                                        f"{item['target']}: {item['error']}"
+                                        for item in result.get("failed_files", [])[:5]
+                                    ),
+                                    "Status": (
+                                        "Completed with failures"
+                                        if result["failed"] or metadata_status.startswith("Failed:")
+                                        else "Done"
+                                    ),
                                 })
                                 s.write(
-                                    f"{zip_name}: uploaded {result['uploaded']}, "
+                                    f"{zip_name}: metadata {metadata_status.lower()}, uploaded {result['uploaded']}, "
                                     f"skipped {result['skipped']}, failed {result['failed']}."
                                 )
                             except Exception as e:
                                 upload_rows.append({
                                     "ZIP file": zip_name,
+                                    "Metadata": "Failed",
                                     "Uploaded": 0,
                                     "Skipped": 0,
                                     "Failed": 1,
@@ -1772,6 +2953,7 @@ with tab_auto:
                                 dbx,
                                 folder,
                                 excluded_colors=excluded_colors,
+                                excluded_garments=excluded_garments,
                                 mockup_source=mockup_source,
                                 metadata=meta,
                             )
@@ -1859,6 +3041,7 @@ with tab_auto:
                                 dbx,
                                 fname,
                                 excluded_colors=excluded_colors,
+                                excluded_garments=excluded_garments,
                                 mockup_source=mockup_source,
                                 metadata=meta_i,
                             )
@@ -2005,7 +3188,7 @@ with tab_auto:
                             else:
                                 if move_after_upload:
                                     try:
-                                        final_path = move_to_finished(get_dropbox_client(), DESIGNS_ROOT, folder, finished_dir="finished")
+                                        final_path = move_selected_to_finished(dbx, folder)
                                         st.success(f"Moved folder to: {final_path}")
                                     except Exception as e:
                                         st.warning(f"Uploaded, but move_to_finished failed: {e}")
@@ -2037,6 +3220,7 @@ with tab_auto:
                                 dbx,
                                 fname,
                                 excluded_colors=excluded_colors,
+                                excluded_garments=excluded_garments,
                                 mockup_source=mockup_source,
                                 metadata=meta,
                             )
@@ -2082,7 +3266,7 @@ with tab_auto:
 
                             if move_after_upload:
                                 try:
-                                    final_path = move_to_finished(get_dropbox_client(), DESIGNS_ROOT, fname, finished_dir="finished")
+                                    final_path = move_selected_to_finished(dbx, fname)
                                     s.write(f"Moved to: {final_path}")
                                 except Exception as e:
                                     s.write(f"Move failed: {e}")
@@ -2130,7 +3314,7 @@ with tab_auto:
                 deleted, dest = clean_and_archive_to_completed(dbx, folder)
                 st.success(f"Deleted {deleted} numbered images and archived to: {dest}")
             except Exception as e:
-                st.error(f"Clean and archive failed: {e}. Tip: move to /finished first.")
+                st.error(f"Clean and archive failed: {e}")
 
         st.divider()
         render_section_header("Batch folder actions")

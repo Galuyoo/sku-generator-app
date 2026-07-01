@@ -1,9 +1,11 @@
 import os
 import re
 import zipfile
+from io import BytesIO
 from pathlib import PurePosixPath
 
 import dropbox
+from PIL import Image, UnidentifiedImageError
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -38,6 +40,7 @@ def inspect_mockup_zip(uploaded_file, expected_count: int = 80) -> dict:
         errors.append("ZIP file could not be read.")
 
     image_count = len(images)
+    invalid_images = validate_mockup_images(images[:expected_count])
     if image_count == 0:
         errors.append("No supported image files found.")
     elif image_count < expected_count:
@@ -45,10 +48,21 @@ def inspect_mockup_zip(uploaded_file, expected_count: int = 80) -> dict:
     elif image_count > expected_count:
         warnings.append(f"Found {image_count} images; only the first {expected_count} will be uploaded.")
 
+    if invalid_images:
+        invalid_labels = ", ".join(
+            f"{item['target_number']} ({item['source']}: {item['error']})"
+            for item in invalid_images[:8]
+        )
+        remaining = len(invalid_images) - 8
+        if remaining > 0:
+            invalid_labels = f"{invalid_labels}; +{remaining} more"
+        errors.append(f"Invalid/corrupt image files: {invalid_labels}")
+
     return {
         "filename": filename,
         "sku": sku,
         "images_found": image_count,
+        "invalid_images": invalid_images,
         "errors": errors,
         "warnings": warnings,
     }
@@ -72,6 +86,37 @@ def extract_mockup_images(uploaded_file) -> list[tuple[str, bytes, str]]:
     return sorted(images, key=lambda item: natural_sort_key(item[0]))
 
 
+def validate_image_bytes(content: bytes) -> tuple[bool, str]:
+    if not content:
+        return False, "empty file"
+
+    try:
+        with Image.open(BytesIO(content)) as img:
+            img.verify()
+        with Image.open(BytesIO(content)) as img:
+            img.load()
+    except UnidentifiedImageError:
+        return False, "not a readable image"
+    except Exception as exc:
+        return False, str(exc)
+
+    return True, ""
+
+
+def validate_mockup_images(images: list[tuple[str, bytes, str]]) -> list[dict]:
+    invalid = []
+    for index, (source_name, content, ext) in enumerate(images, start=1):
+        ok, error = validate_image_bytes(content)
+        if not ok:
+            invalid.append({
+                "source": source_name,
+                "target_number": index,
+                "target": f"{index}{ext.lower()}",
+                "error": error,
+            })
+    return invalid
+
+
 def upload_mockup_images_to_dropbox(
     dbx,
     target_folder_path,
@@ -90,6 +135,11 @@ def upload_mockup_images_to_dropbox(
     for index, (source_name, content, ext) in enumerate(images[:expected_count], start=1):
         target_name = f"{index}{ext.lower()}"
         target_path = f"{target_folder_path.rstrip('/')}/{target_name}"
+
+        ok, error = validate_image_bytes(content)
+        if not ok:
+            failed.append({"source": source_name, "target": target_name, "error": f"invalid image: {error}"})
+            continue
 
         if not overwrite and index in existing_numbers:
             skipped.append({"source": source_name, "target": target_name, "reason": "already exists"})
