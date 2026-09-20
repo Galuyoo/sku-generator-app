@@ -145,6 +145,8 @@ def upload_products_from_df(df, progress=None, variant_budget=None):
         if dropped_missing:
             _say(progress, f"⚠️ Dropped {dropped_missing} rows with missing Size/Colour.")
         if dropped_dupe:
+            total_duplicate_rows_prevented += dropped_dupe
+            log_event("duplicate_prevented", job_id=job_id, channel="shopify", duplicate_count=dropped_dupe)
             _say(progress, f"ℹ️ Skipped {dropped_dupe} duplicate (Size,Colour) combos.")
 
         if not variants:
@@ -281,6 +283,7 @@ def upload_products_from_df(df, progress=None, variant_budget=None):
         products_count=len(results),
         variants_count=sum(int(item.get("created_variants") or 0) for item in results),
         image_mappings_count=sum(int(item.get("created_images") or 0) for item in results),
+        duplicate_count=total_duplicate_rows_prevented,
     )
     _say(progress, f"⏱ All products in this design uploaded in {_fmt_secs(total)}")
     return results
