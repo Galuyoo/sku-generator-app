@@ -29,6 +29,7 @@ from utils.dropbox_utils import (
 )
 from utils.ui_utils import render_logo
 from utils.shopify_utils import upload_products_from_df, ShopifyError
+from utils.metrics import log_event as log_metric_event
 from utils.dropbox_utils import load_dropbox_image_links_parallel as load_dropbox_image_links
 
 import io, zipfile
@@ -619,6 +620,8 @@ with tab_manual:
 
     if submit:
         st.session_state.generating = True
+        metric_started = time.perf_counter()
+        metric_job_id = f"manual:{sku_suffix}:{int(time.time())}"
         try:
             desc_list = [d.strip() for d in raw_descriptions.split("|") if d.strip()]
             if len(desc_list) != len(garment_keys):
@@ -656,6 +659,18 @@ with tab_manual:
             else:
                 filename = f"{sku_suffix}.csv"
                 df.to_csv(filename, index=False, encoding="utf-8-sig")
+                log_metric_event(
+                    "generation_completed",
+                    job_id=metric_job_id,
+                    operator_id=lister,
+                    channel="shopify_csv",
+                    duration_ms=int((time.perf_counter() - metric_started) * 1000),
+                    products_count=int(df["Handle"].nunique()) if "Handle" in df.columns else None,
+                    variants_count=len(df),
+                    skus_count=int(df["Variant SKU"].nunique()) if "Variant SKU" in df.columns else None,
+                    image_mappings_count=int(df["Image Src"].notna().sum()) if "Image Src" in df.columns else None,
+                    metadata={"mode": "manual"},
+                )
                 with open(filename, "rb") as f:
                     st.download_button("📥 Download CSV File", f, file_name=filename)
 
@@ -694,6 +709,16 @@ with tab_manual:
                     st.markdown("---")
                     
         except Exception as e:
+            log_metric_event(
+                "generation_failed",
+                status="failure",
+                job_id=metric_job_id,
+                operator_id=lister,
+                channel="shopify_csv",
+                duration_ms=int((time.perf_counter() - metric_started) * 1000),
+                error=e,
+                metadata={"mode": "manual"},
+            )
             st.error("❌ Something went wrong while generating the CSV.")
             st.exception(e)
         finally:
@@ -988,6 +1013,17 @@ with tab_auto:
                                 st.session_state.auto_folder = folder
                                 st.session_state.auto_meta = meta
                                 build_succeeded = True
+                                log_metric_event(
+                                    "generation_completed",
+                                    job_id=f"auto:{folder}:{int(time.time())}",
+                                    channel="shopify_csv",
+                                    duration_ms=int((time.perf_counter() - design_start) * 1000),
+                                    products_count=int(df["Handle"].nunique()) if "Handle" in df.columns else None,
+                                    variants_count=len(df),
+                                    skus_count=int(df["Variant SKU"].nunique()) if "Variant SKU" in df.columns else None,
+                                    image_mappings_count=int(df["Image Src"].notna().sum()) if "Image Src" in df.columns else None,
+                                    metadata={"mode": "selected_folder", "folder": folder},
+                                )
 
                     if has_validation_errors(st.session_state.auto_validation):
                         st.error("CSV export and Shopify upload blocked by listing safety errors.")
