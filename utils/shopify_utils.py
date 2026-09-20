@@ -7,6 +7,7 @@ import base64
 import urllib.parse
 import re
 from collections import defaultdict
+from utils.metrics import log_event
 
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2024-10")
 
@@ -86,6 +87,8 @@ def upload_products_from_df(df, progress=None, variant_budget=None):
     Optional variant_budget caps total variants across all products.
     """
     overall_start = time.perf_counter()
+    job_id = os.urandom(8).hex()
+    log_event("shopify_publish_started", job_id=job_id, channel="shopify", products_count=int(df["Handle"].nunique()), variants_count=len(df))
 
     _say(progress, "✅ Shopify upload started")
     _say(progress, f"📦 Total rows in DataFrame: {len(df)}")
@@ -142,6 +145,8 @@ def upload_products_from_df(df, progress=None, variant_budget=None):
         if dropped_missing:
             _say(progress, f"⚠️ Dropped {dropped_missing} rows with missing Size/Colour.")
         if dropped_dupe:
+            total_duplicate_rows_prevented += dropped_dupe
+            log_event("duplicate_prevented", job_id=job_id, channel="shopify", duplicate_count=dropped_dupe)
             _say(progress, f"ℹ️ Skipped {dropped_dupe} duplicate (Size,Colour) combos.")
 
         if not variants:
@@ -270,6 +275,16 @@ def upload_products_from_df(df, progress=None, variant_budget=None):
             time.sleep(CREATE_COOLDOWN)
 
     total = time.perf_counter() - overall_start
+    log_event(
+        "shopify_publish_completed",
+        job_id=job_id,
+        channel="shopify",
+        duration_ms=int(total * 1000),
+        products_count=len(results),
+        variants_count=sum(int(item.get("created_variants") or 0) for item in results),
+        image_mappings_count=sum(int(item.get("created_images") or 0) for item in results),
+        duplicate_count=total_duplicate_rows_prevented,
+    )
     _say(progress, f"⏱ All products in this design uploaded in {_fmt_secs(total)}")
     return results
 
@@ -303,6 +318,7 @@ def _post(url, json, progress=None):
             _say(progress, f"📥 Response status: {r.status_code}")
 
             if r.status_code == 429:
+                log_event("shopify_api_retry", status="partial_success", channel="shopify", retry_count=attempt, error="HTTP 429 rate limit")
                 txt = (r.text or "").lower()
                 if "daily variant creation limit" in txt:
                     raise ShopifyError("DAILY_VARIANT_LIMIT: " + r.text)
